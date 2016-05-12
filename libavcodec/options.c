@@ -197,6 +197,7 @@ int avcodec_copy_context(AVCodecContext *dest, const AVCodecContext *src)
     av_freep(&dest->inter_matrix);
     av_freep(&dest->extradata);
     av_freep(&dest->subtitle_header);
+    av_buffer_unref(&dest->hw_frames_ctx);
 
     memcpy(dest, src, sizeof(*dest));
     av_opt_copy(dest, src);
@@ -225,6 +226,7 @@ FF_ENABLE_DEPRECATION_WARNINGS
     dest->inter_matrix    = NULL;
     dest->rc_override     = NULL;
     dest->subtitle_header = NULL;
+    dest->hw_frames_ctx   = NULL;
 
 #define alloc_and_copy_or_fail(obj, size, pad) \
     if (src->obj && size > 0) { \
@@ -245,6 +247,12 @@ FF_ENABLE_DEPRECATION_WARNINGS
     av_assert0(dest->subtitle_header_size == src->subtitle_header_size);
 #undef alloc_and_copy_or_fail
 
+    if (src->hw_frames_ctx) {
+        dest->hw_frames_ctx = av_buffer_ref(src->hw_frames_ctx);
+        if (!dest->hw_frames_ctx)
+            goto fail;
+    }
+
     return 0;
 
 fail:
@@ -255,6 +263,7 @@ fail:
     av_freep(&dest->subtitle_header);
     dest->subtitle_header_size = 0;
     dest->extradata_size = 0;
+    av_buffer_unref(&dest->hw_frames_ctx);
     av_opt_free(dest);
     return AVERROR(ENOMEM);
 }
