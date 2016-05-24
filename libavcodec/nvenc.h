@@ -165,8 +165,7 @@ typedef struct NVENCContext
     int profile;
     int level;
     int tier;
-    int cbr;
-    int twopass;
+    int rc;
     int gpu;
     int flags;
     int buffer_delay;

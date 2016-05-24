@@ -42,6 +42,10 @@
 #include "libavutil/hwcontext_cuda.h"
 #endif
 
+#define IS_CBR(rc) (rc == NV_ENC_PARAMS_RC_CBR ||               \
+                    rc == NV_ENC_PARAMS_RC_2_PASS_QUALITY ||    \
+                    rc == NV_ENC_PARAMS_RC_2_PASS_FRAMESIZE_CAP)
+
 #if defined(_WIN32)
 #define LOAD_FUNC(l, s) GetProcAddress(l, s)
 #define DL_CLOSE_FUNC(l) FreeLibrary(l)
@@ -469,126 +473,151 @@ static int nvenc_map_preset(NVENCContext *ctx)
 static av_cold void set_constqp(AVCodecContext *avctx)
 {
     NVENCContext *ctx = avctx->priv_data;
+    NV_ENC_RC_PARAMS *rc = &ctx->config.rcParams;
 
-    ctx->config.rcParams.rateControlMode = NV_ENC_PARAMS_RC_CONSTQP;
-    ctx->config.rcParams.constQP.qpInterB = avctx->global_quality;
-    ctx->config.rcParams.constQP.qpInterP = avctx->global_quality;
-    ctx->config.rcParams.constQP.qpIntra = avctx->global_quality;
+    rc->rateControlMode = NV_ENC_PARAMS_RC_CONSTQP;
+    rc->constQP.qpInterB = avctx->global_quality;
+    rc->constQP.qpInterP = avctx->global_quality;
+    rc->constQP.qpIntra  = avctx->global_quality;
+
+    avctx->qmin = -1;
+    avctx->qmax = -1;
 }
 
 static av_cold void set_vbr(AVCodecContext *avctx)
 {
     NVENCContext *ctx = avctx->priv_data;
+    NV_ENC_RC_PARAMS *rc = &ctx->config.rcParams;
 
-    ctx->config.rcParams.enableMinQP = 1;
-    ctx->config.rcParams.enableMaxQP = 1;
+    int qp_inter_p;
 
-    ctx->config.rcParams.minQP.qpInterB = avctx->qmin;
-    ctx->config.rcParams.minQP.qpInterP = avctx->qmin;
-    ctx->config.rcParams.minQP.qpIntra = avctx->qmin;
+    if (avctx->qmin >= 0) {
+        rc->enableMinQP    = 1;
+        rc->minQP.qpInterB = avctx->qmin;
+        rc->minQP.qpInterP = avctx->qmin;
+        rc->minQP.qpIntra  = avctx->qmin;
+    }
 
-    ctx->config.rcParams.maxQP.qpInterB = avctx->qmax;
-    ctx->config.rcParams.maxQP.qpInterP = avctx->qmax;
-    ctx->config.rcParams.maxQP.qpIntra = avctx->qmax;
+    if (avctx->qmax >= 0) {
+        rc->enableMaxQP = 1;
+        rc->maxQP.qpInterB = avctx->qmax;
+        rc->maxQP.qpInterP = avctx->qmax;
+        rc->maxQP.qpIntra  = avctx->qmax;
+    }
+
+    if (avctx->qmin >= 0 && avctx->qmax >= 0) {
+        qp_inter_p = (avctx->qmax + 3 * avctx->qmin) / 4; // biased towards Qmin
+    } else {
+        qp_inter_p = 26; // default to 26
+    }
+
+    rc->enableInitialRCQP = 1;
+    rc->initialRCQP.qpInterP  = qp_inter_p;
+
+    if(avctx->i_quant_factor != 0.0 && avctx->b_quant_factor != 0.0) {
+        rc->initialRCQP.qpIntra = av_clip(
+            qp_inter_p * fabs(avctx->i_quant_factor) + avctx->i_quant_offset, 0, 51);
+        rc->initialRCQP.qpInterB = av_clip(
+            qp_inter_p * fabs(avctx->b_quant_factor) + avctx->b_quant_offset, 0, 51);
+    } else {
+        rc->initialRCQP.qpIntra = qp_inter_p;
+        rc->initialRCQP.qpInterB = qp_inter_p;
+    }
 }
 
 static av_cold void set_lossless(AVCodecContext *avctx)
 {
     NVENCContext *ctx = avctx->priv_data;
+    NV_ENC_RC_PARAMS *rc = &ctx->config.rcParams;
 
-    ctx->config.rcParams.rateControlMode = NV_ENC_PARAMS_RC_CONSTQP;
-    ctx->config.rcParams.constQP.qpInterB = 0;
-    ctx->config.rcParams.constQP.qpInterP = 0;
-    ctx->config.rcParams.constQP.qpIntra = 0;
+    rc->rateControlMode  = NV_ENC_PARAMS_RC_CONSTQP;
+    rc->constQP.qpInterB = 0;
+    rc->constQP.qpInterP = 0;
+    rc->constQP.qpIntra  = 0;
+
+    avctx->qmin = -1;
+    avctx->qmax = -1;
+}
+
+static void nvenc_override_rate_control(AVCodecContext *avctx)
+{
+    NVENCContext *ctx    = avctx->priv_data;
+
+    switch (ctx->rc) {
+    case NV_ENC_PARAMS_RC_CONSTQP:
+        if (avctx->global_quality < 0) {
+            av_log(avctx, AV_LOG_WARNING,
+                   "The constant quality rate-control requires "
+                   "the 'global_quality' option set.\n");
+            return;
+        }
+        set_constqp(avctx);
+        return;
+    case NV_ENC_PARAMS_RC_2_PASS_VBR:
+    case NV_ENC_PARAMS_RC_VBR:
+        if (avctx->qmin < 0 && avctx->qmax < 0) {
+            av_log(avctx, AV_LOG_WARNING,
+                   "The variable bitrate rate-control requires "
+                   "the 'qmin' and/or 'qmax' option set.\n");
+            return;
+        }
+    case NV_ENC_PARAMS_RC_VBR_MINQP:
+        if (avctx->qmin < 0) {
+            av_log(avctx, AV_LOG_WARNING,
+                   "The variable bitrate rate-control requires "
+                   "the 'qmin' option set.\n");
+            return;
+        }
+        set_vbr(avctx);
+        break;
+    case NV_ENC_PARAMS_RC_CBR:
+        break;
+    case NV_ENC_PARAMS_RC_2_PASS_QUALITY:
+    case NV_ENC_PARAMS_RC_2_PASS_FRAMESIZE_CAP:
+        if (!(ctx->flags & NVENC_LOWLATENCY)) {
+            av_log(avctx, AV_LOG_WARNING,
+                   "The multipass rate-control requires "
+                   "a low-latency preset.\n");
+            return;
+        }
+    }
+
+    ctx->config.rcParams.rateControlMode = ctx->rc;
 }
 
 static av_cold void nvenc_setup_rate_control(AVCodecContext *avctx)
 {
     NVENCContext *ctx    = avctx->priv_data;
-
-    int qp_inter_p;
+    NV_ENC_RC_PARAMS *rc = &ctx->config.rcParams;
 
     if (avctx->bit_rate > 0) {
-        ctx->config.rcParams.averageBitRate = avctx->bit_rate;
-    } else if (ctx->config.rcParams.averageBitRate > 0) {
-        ctx->config.rcParams.maxBitRate = ctx->config.rcParams.averageBitRate;
+        rc->averageBitRate = avctx->bit_rate;
+    } else if (rc->averageBitRate > 0) {
+        rc->maxBitRate = rc->averageBitRate;
     }
 
     if (avctx->rc_max_rate > 0)
-        ctx->config.rcParams.maxBitRate = avctx->rc_max_rate;
+        rc->maxBitRate = avctx->rc_max_rate;
 
     if (ctx->flags & NVENC_LOSSLESS) {
         set_lossless(avctx);
-
-        avctx->qmin = -1;
-        avctx->qmax = -1;
-    } else if (ctx->cbr) {
-        if (!ctx->twopass) {
-            ctx->config.rcParams.rateControlMode = NV_ENC_PARAMS_RC_CBR;
-        } else {
-            ctx->config.rcParams.rateControlMode = NV_ENC_PARAMS_RC_2_PASS_QUALITY;
-
-            if (avctx->codec->id == AV_CODEC_ID_H264) {
-                ctx->config.encodeCodecConfig.h264Config.adaptiveTransformMode = NV_ENC_H264_ADAPTIVE_TRANSFORM_ENABLE;
-                ctx->config.encodeCodecConfig.h264Config.fmoMode = NV_ENC_H264_FMO_DISABLE;
-            }
-        }
-
-        if (avctx->codec->id == AV_CODEC_ID_H264) {
-            ctx->config.encodeCodecConfig.h264Config.outputBufferingPeriodSEI = 1;
-            ctx->config.encodeCodecConfig.h264Config.outputPictureTimingSEI = 1;
-        } else if(avctx->codec->id == AV_CODEC_ID_H265) {
-            ctx->config.encodeCodecConfig.hevcConfig.outputBufferingPeriodSEI = 1;
-            ctx->config.encodeCodecConfig.hevcConfig.outputPictureTimingSEI = 1;
-        }
+    } else if (ctx->rc > 0) {
+        nvenc_override_rate_control(avctx);
     } else if (avctx->global_quality > 0) {
         set_constqp(avctx);
-
-        avctx->qmin = -1;
-        avctx->qmax = -1;
     } else {
         if (avctx->qmin >= 0 && avctx->qmax >= 0) {
-            set_vbr(avctx);
-
-            qp_inter_p = (avctx->qmax + 3 * avctx->qmin) / 4; // biased towards Qmin
-
-            if (ctx->twopass) {
-                ctx->config.rcParams.rateControlMode = NV_ENC_PARAMS_RC_2_PASS_VBR;
-                if (avctx->codec->id == AV_CODEC_ID_H264) {
-                    ctx->config.encodeCodecConfig.h264Config.adaptiveTransformMode = NV_ENC_H264_ADAPTIVE_TRANSFORM_ENABLE;
-                    ctx->config.encodeCodecConfig.h264Config.fmoMode = NV_ENC_H264_FMO_DISABLE;
-                }
-            } else {
-                ctx->config.rcParams.rateControlMode = NV_ENC_PARAMS_RC_VBR_MINQP;
-            }
+            rc->rateControlMode = NV_ENC_PARAMS_RC_VBR_MINQP;
         } else {
-            qp_inter_p = 26; // default to 26
-
-            if (ctx->twopass) {
-                ctx->config.rcParams.rateControlMode = NV_ENC_PARAMS_RC_2_PASS_VBR;
-            } else {
-                ctx->config.rcParams.rateControlMode = NV_ENC_PARAMS_RC_VBR;
-            }
+            rc->rateControlMode = NV_ENC_PARAMS_RC_VBR;
         }
-
-        ctx->config.rcParams.enableInitialRCQP = 1;
-        ctx->config.rcParams.initialRCQP.qpInterP  = qp_inter_p;
-
-        if(avctx->i_quant_factor != 0.0 && avctx->b_quant_factor != 0.0) {
-            ctx->config.rcParams.initialRCQP.qpIntra = av_clip(
-                qp_inter_p * fabs(avctx->i_quant_factor) + avctx->i_quant_offset, 0, 51);
-            ctx->config.rcParams.initialRCQP.qpInterB = av_clip(
-                qp_inter_p * fabs(avctx->b_quant_factor) + avctx->b_quant_offset, 0, 51);
-        } else {
-            ctx->config.rcParams.initialRCQP.qpIntra = qp_inter_p;
-            ctx->config.rcParams.initialRCQP.qpInterB = qp_inter_p;
-        }
+	set_vbr(avctx);
     }
 
     if (avctx->rc_buffer_size > 0) {
-        ctx->config.rcParams.vbvBufferSize = avctx->rc_buffer_size;
-    } else if (ctx->config.rcParams.averageBitRate > 0) {
-        ctx->config.rcParams.vbvBufferSize = 2 * ctx->config.rcParams.averageBitRate;
+        rc->vbvBufferSize = avctx->rc_buffer_size;
+    } else if (rc->averageBitRate > 0) {
+        rc->vbvBufferSize = 2 * rc->averageBitRate;
     }
 }
 
@@ -624,6 +653,19 @@ static av_cold int nvenc_setup_h264_config(AVCodecContext *avctx)
 
     if (ctx->flags & NVENC_LOSSLESS)
         h264->qpPrimeYZeroTransformBypassFlag = 1;
+
+    if (IS_CBR(cc->rcParams.rateControlMode)) {
+        h264->outputBufferingPeriodSEI = 1;
+        h264->outputPictureTimingSEI   = 1;
+    }
+
+    if (cc->rcParams.rateControlMode == NV_ENC_PARAMS_RC_2_PASS_QUALITY ||
+        cc->rcParams.rateControlMode == NV_ENC_PARAMS_RC_2_PASS_FRAMESIZE_CAP ||
+        cc->rcParams.rateControlMode == NV_ENC_PARAMS_RC_2_PASS_VBR)
+    {
+        h264->adaptiveTransformMode = NV_ENC_H264_ADAPTIVE_TRANSFORM_ENABLE;
+        h264->fmoMode = NV_ENC_H264_FMO_DISABLE;
+    }
 
     switch(ctx->profile) {
     case NV_ENC_H264_PROFILE_BASELINE:
@@ -686,6 +728,11 @@ static av_cold int nvenc_setup_hevc_config(AVCodecContext *avctx)
     hevc->disableSPSPPS = (avctx->flags & AV_CODEC_FLAG_GLOBAL_HEADER) ? 1 : 0;
     hevc->repeatSPSPPS  = (avctx->flags & AV_CODEC_FLAG_GLOBAL_HEADER) ? 0 : 1;
     hevc->outputAUD     = 1;
+
+    if (IS_CBR(cc->rcParams.rateControlMode)) {
+        hevc->outputBufferingPeriodSEI = 1;
+        hevc->outputPictureTimingSEI   = 1;
+    }
 
     /* No other profile is supported in the current SDK version 5 */
     cc->profileGUID = NV_ENC_HEVC_PROFILE_MAIN_GUID;
@@ -773,10 +820,6 @@ static av_cold int nvenc_setup_encoder(AVCodecContext *avctx)
 
     preset_cfg.version           = NV_ENC_PRESET_CONFIG_VER;
     preset_cfg.presetCfg.version = NV_ENC_CONFIG_VER;
-
-    if (ctx->twopass < 0) {
-        ctx->twopass = (ctx->flags & NVENC_LOWLATENCY) ? 1 : 0;
-    }
 
     ret = nv->nvEncGetEncodePresetConfig(ctx->nvenc_ctx,
                                          ctx->params.encodeGUID,
