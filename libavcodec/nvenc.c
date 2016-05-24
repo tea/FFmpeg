@@ -587,9 +587,6 @@ static av_cold void nvenc_setup_rate_control(AVCodecContext *avctx)
         ctx->config.rcParams.maxBitRate = avctx->rc_max_rate;
 
     if (ctx->flags & NVENC_LOSSLESS) {
-        if (avctx->codec->id == AV_CODEC_ID_H264)
-            ctx->config.encodeCodecConfig.h264Config.qpPrimeYZeroTransformBypassFlag = 1;
-
         set_lossless(avctx);
 
         avctx->qmin = -1;
@@ -695,43 +692,29 @@ static av_cold int nvenc_setup_h264_config(AVCodecContext *avctx)
     h264->sliceMode = 3;
     h264->sliceModeData = 1;
 
-    if (!ctx->profile && !(ctx->flags & NVENC_LOSSLESS)) {
-        switch (avctx->profile) {
-        case FF_PROFILE_H264_HIGH_444_PREDICTIVE:
-            cc->profileGUID = NV_ENC_H264_PROFILE_HIGH_444_GUID;
-            break;
-        case FF_PROFILE_H264_BASELINE:
-            cc->profileGUID = NV_ENC_H264_PROFILE_BASELINE_GUID;
-            break;
-        case FF_PROFILE_H264_MAIN:
-            cc->profileGUID = NV_ENC_H264_PROFILE_MAIN_GUID;
-            break;
-        case FF_PROFILE_H264_HIGH:
-        case FF_PROFILE_UNKNOWN:
-            cc->profileGUID = NV_ENC_H264_PROFILE_HIGH_GUID;
-            break;
-        default:
-            av_log(avctx, AV_LOG_WARNING, "Unsupported profile requested, falling back to high\n");
-            cc->profileGUID = NV_ENC_H264_PROFILE_HIGH_GUID;
-            break;
-        }
-    } else if(!(ctx->flags & NVENC_LOSSLESS)) {
-        if (!strcmp(ctx->profile, "high")) {
-            cc->profileGUID = NV_ENC_H264_PROFILE_HIGH_GUID;
-            avctx->profile = FF_PROFILE_H264_HIGH;
-        } else if (!strcmp(ctx->profile, "main")) {
-            cc->profileGUID = NV_ENC_H264_PROFILE_MAIN_GUID;
-            avctx->profile = FF_PROFILE_H264_MAIN;
-        } else if (!strcmp(ctx->profile, "baseline")) {
-            cc->profileGUID = NV_ENC_H264_PROFILE_BASELINE_GUID;
-            avctx->profile = FF_PROFILE_H264_BASELINE;
-        } else if (!strcmp(ctx->profile, "high444p")) {
-            cc->profileGUID = NV_ENC_H264_PROFILE_HIGH_444_GUID;
-            avctx->profile = FF_PROFILE_H264_HIGH_444_PREDICTIVE;
-        } else {
-            av_log(avctx, AV_LOG_FATAL, "Profile \"%s\" is unknown! Supported profiles: high, main, baseline\n", ctx->profile);
-            return AVERROR(EINVAL);
-        }
+    if (ctx->flags & NVENC_LOSSLESS)
+        h264->qpPrimeYZeroTransformBypassFlag = 1;
+
+    switch(ctx->profile) {
+    case NV_ENC_H264_PROFILE_BASELINE:
+        cc->profileGUID = NV_ENC_H264_PROFILE_BASELINE_GUID;
+        avctx->profile = FF_PROFILE_H264_BASELINE;
+        break;
+    case NV_ENC_H264_PROFILE_MAIN:
+        cc->profileGUID = NV_ENC_H264_PROFILE_MAIN_GUID;
+        avctx->profile = FF_PROFILE_H264_MAIN;
+        break;
+    case NV_ENC_H264_PROFILE_HIGH:
+        cc->profileGUID = NV_ENC_H264_PROFILE_HIGH_GUID;
+        avctx->profile = FF_PROFILE_H264_HIGH;
+        break;
+    case NV_ENC_H264_PROFILE_HIGH_444_P:
+        cc->profileGUID = NV_ENC_H264_PROFILE_HIGH_444_GUID;
+        avctx->profile = FF_PROFILE_H264_HIGH_444_PREDICTIVE;
+        break;
+    case NV_ENC_H264_PROFILE_CONSTRAINED_HIGH:
+        cc->profileGUID = NV_ENC_H264_PROFILE_CONSTRAINED_HIGH_GUID;
+        break;
     }
 
     // force setting profile as high444p if input is AV_PIX_FMT_YUV444P
