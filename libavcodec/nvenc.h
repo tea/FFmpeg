@@ -103,6 +103,24 @@ typedef struct NVENCLibraryContext
 #endif
 } NVENCLibraryContext;
 
+enum {
+    PRESET_DEFAULT,
+    PRESET_HP,
+    PRESET_HQ,
+    PRESET_BD ,
+    PRESET_LOW_LATENCY_DEFAULT ,
+    PRESET_LOW_LATENCY_HQ ,
+    PRESET_LOW_LATENCY_HP,
+    PRESET_LOSSLESS_DEFAULT,
+    PRESET_LOSSLESS_HP,
+};
+
+enum {
+    NVENC_LOWLATENCY = 1,
+    NVENC_LOSSLESS   = 2
+};
+
+
 typedef struct NVENCContext
 {
     AVClass *class;
@@ -135,13 +153,14 @@ typedef struct NVENCContext
 
     void *nvenc_ctx;
 
-    char *preset;
+    int preset;
     char *profile;
     char *level;
     char *tier;
     int cbr;
     int twopass;
     int gpu;
+    int flags;
     int buffer_delay;
 } NVENCContext;
 
