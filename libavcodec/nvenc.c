@@ -58,63 +58,6 @@ typedef struct NvencData
     } u;
 } NvencData;
 
-typedef struct NvencValuePair
-{
-    const char *str;
-    uint32_t num;
-} NvencValuePair;
-
-static const NvencValuePair nvenc_h264_level_pairs[] = {
-    { "auto", NV_ENC_LEVEL_AUTOSELECT },
-    { "1"   , NV_ENC_LEVEL_H264_1     },
-    { "1.0" , NV_ENC_LEVEL_H264_1     },
-    { "1b"  , NV_ENC_LEVEL_H264_1b    },
-    { "1.0b", NV_ENC_LEVEL_H264_1b    },
-    { "1.1" , NV_ENC_LEVEL_H264_11    },
-    { "1.2" , NV_ENC_LEVEL_H264_12    },
-    { "1.3" , NV_ENC_LEVEL_H264_13    },
-    { "2"   , NV_ENC_LEVEL_H264_2     },
-    { "2.0" , NV_ENC_LEVEL_H264_2     },
-    { "2.1" , NV_ENC_LEVEL_H264_21    },
-    { "2.2" , NV_ENC_LEVEL_H264_22    },
-    { "3"   , NV_ENC_LEVEL_H264_3     },
-    { "3.0" , NV_ENC_LEVEL_H264_3     },
-    { "3.1" , NV_ENC_LEVEL_H264_31    },
-    { "3.2" , NV_ENC_LEVEL_H264_32    },
-    { "4"   , NV_ENC_LEVEL_H264_4     },
-    { "4.0" , NV_ENC_LEVEL_H264_4     },
-    { "4.1" , NV_ENC_LEVEL_H264_41    },
-    { "4.2" , NV_ENC_LEVEL_H264_42    },
-    { "5"   , NV_ENC_LEVEL_H264_5     },
-    { "5.0" , NV_ENC_LEVEL_H264_5     },
-    { "5.1" , NV_ENC_LEVEL_H264_51    },
-    { NULL }
-};
-
-static const NvencValuePair nvenc_hevc_level_pairs[] = {
-    { "auto", NV_ENC_LEVEL_AUTOSELECT },
-    { "1"   , NV_ENC_LEVEL_HEVC_1     },
-    { "1.0" , NV_ENC_LEVEL_HEVC_1     },
-    { "2"   , NV_ENC_LEVEL_HEVC_2     },
-    { "2.0" , NV_ENC_LEVEL_HEVC_2     },
-    { "2.1" , NV_ENC_LEVEL_HEVC_21    },
-    { "3"   , NV_ENC_LEVEL_HEVC_3     },
-    { "3.0" , NV_ENC_LEVEL_HEVC_3     },
-    { "3.1" , NV_ENC_LEVEL_HEVC_31    },
-    { "4"   , NV_ENC_LEVEL_HEVC_4     },
-    { "4.0" , NV_ENC_LEVEL_HEVC_4     },
-    { "4.1" , NV_ENC_LEVEL_HEVC_41    },
-    { "5"   , NV_ENC_LEVEL_HEVC_5     },
-    { "5.0" , NV_ENC_LEVEL_HEVC_5     },
-    { "5.1" , NV_ENC_LEVEL_HEVC_51    },
-    { "5.2" , NV_ENC_LEVEL_HEVC_52    },
-    { "6"   , NV_ENC_LEVEL_HEVC_6     },
-    { "6.0" , NV_ENC_LEVEL_HEVC_6     },
-    { "6.1" , NV_ENC_LEVEL_HEVC_61    },
-    { "6.2" , NV_ENC_LEVEL_HEVC_62    },
-    { NULL }
-};
-
 const enum AVPixelFormat ff_nvenc_pix_fmts[] = {
     AV_PIX_FMT_YUV420P,
     AV_PIX_FMT_NV12,
@@ -181,18 +124,6 @@ static int nvenc_print_error(void *log_ctx, NVENCSTATUS err,
     ret = nvenc_map_error(err, &desc);
     av_log(log_ctx, AV_LOG_ERROR, "%s: %s (%d)\n", error_string, desc, err);
     return ret;
-}
-
-static int input_string_to_uint32(AVCodecContext *avctx, const NvencValuePair *pair, const char *input, uint32_t *output)
-{
-    for (; pair->str; ++pair) {
-        if (!strcmp(input, pair->str)) {
-            *output = pair->num;
-            return 0;
-        }
-    }
-
-    return AVERROR(EINVAL);
 }
 
 #define CHECK_LOAD_FUNC(t, f, s) \
@@ -667,7 +598,6 @@ static av_cold int nvenc_setup_h264_config(AVCodecContext *avctx)
     NV_ENC_CONFIG *cc                      = &ctx->config;
     NV_ENC_CONFIG_H264 *h264               = &cc->encodeCodecConfig.h264Config;
     NV_ENC_CONFIG_H264_VUI_PARAMETERS *vui = &h264->h264VUIParameters;
-    int res;
 
     vui->colourDescriptionPresentFlag = avctx->colorspace      != AVCOL_SPC_UNSPECIFIED ||
                                         avctx->color_primaries != AVCOL_PRI_UNSPECIFIED ||
@@ -725,16 +655,7 @@ static av_cold int nvenc_setup_h264_config(AVCodecContext *avctx)
 
     h264->chromaFormatIDC = avctx->profile == FF_PROFILE_H264_HIGH_444_PREDICTIVE ? 3 : 1;
 
-    if (ctx->level) {
-        res = input_string_to_uint32(avctx, nvenc_h264_level_pairs, ctx->level, &h264->level);
-
-        if (res) {
-            av_log(avctx, AV_LOG_FATAL, "Level \"%s\" is unknown! Supported levels: auto, 1, 1b, 1.1, 1.2, 1.3, 2, 2.1, 2.2, 3, 3.1, 3.2, 4, 4.1, 4.2, 5, 5.1\n", ctx->level);
-            return res;
-        }
-    } else {
-        h264->level = NV_ENC_LEVEL_AUTOSELECT;
-    }
+    h264->level = ctx->level;
 
     return 0;
 }
@@ -745,7 +666,6 @@ static av_cold int nvenc_setup_hevc_config(AVCodecContext *avctx)
     NV_ENC_CONFIG *cc                      = &ctx->config;
     NV_ENC_CONFIG_HEVC *hevc               = &cc->encodeCodecConfig.hevcConfig;
     NV_ENC_CONFIG_HEVC_VUI_PARAMETERS *vui = &hevc->hevcVUIParameters;
-    int res;
 
     vui->colourDescriptionPresentFlag = avctx->colorspace      != AVCOL_SPC_UNSPECIFIED ||
                                         avctx->color_primaries != AVCOL_PRI_UNSPECIFIED ||
@@ -774,16 +694,7 @@ static av_cold int nvenc_setup_hevc_config(AVCodecContext *avctx)
     hevc->sliceMode = 3;
     hevc->sliceModeData = 1;
 
-    if (ctx->level) {
-        res = input_string_to_uint32(avctx, nvenc_hevc_level_pairs, ctx->level, &hevc->level);
-
-        if (res) {
-            av_log(avctx, AV_LOG_FATAL, "Level \"%s\" is unknown! Supported levels: auto, 1, 2, 2.1, 3, 3.1, 4, 4.1, 5, 5.1, 5.2, 6, 6.1, 6.2\n", ctx->level);
-            return res;
-        }
-    } else {
-        hevc->level = NV_ENC_LEVEL_AUTOSELECT;
-    }
+    hevc->level = ctx->level;
 
     if (ctx->tier) {
         if (!strcmp(ctx->tier, "main")) {

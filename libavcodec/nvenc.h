@@ -163,7 +163,7 @@ typedef struct NVENCContext
 
     int preset;
     int profile;
-    char *level;
+    int level;
     char *tier;
     int cbr;
     int twopass;
