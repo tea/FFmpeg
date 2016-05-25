@@ -97,17 +97,18 @@ static const AVClass nvenc_hevc_class = {
 };
 
 AVCodec ff_nvenc_hevc_encoder = {
-    .name = "nvenc_hevc",
-    .long_name = NULL_IF_CONFIG_SMALL("NVIDIA NVENC hevc encoder"),
-    .type = AVMEDIA_TYPE_VIDEO,
-    .id = AV_CODEC_ID_H265,
+    .name           = "nvenc_hevc",
+    .long_name      = NULL_IF_CONFIG_SMALL("NVIDIA NVENC hevc encoder"),
+    .type           = AVMEDIA_TYPE_VIDEO,
+    .id             = AV_CODEC_ID_H265,
+    .init           = ff_nvenc_encode_init,
+    .encode2        = ff_nvenc_encode_frame,
+    .close          = ff_nvenc_encode_close,
     .priv_data_size = sizeof(NVENCContext),
-    .init = ff_nvenc_encode_init,
-    .encode2 = ff_nvenc_encode_frame,
-    .close = ff_nvenc_encode_close,
-    .capabilities = AV_CODEC_CAP_DELAY,
-    .priv_class = &nvenc_hevc_class,
-    .defaults = nvenc_defaults,
-    .pix_fmts = ff_nvenc_pix_fmts,
+    .priv_class     = &nvenc_hevc_class,
+    .defaults       = nvenc_defaults,
+    .pix_fmts       = ff_nvenc_pix_fmts,
+    .capabilities   = AV_CODEC_CAP_DELAY,
+    .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,
 };
 #endif

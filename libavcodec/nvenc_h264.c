@@ -113,6 +113,7 @@ AVCodec ff_nvenc_encoder = {
     .capabilities = AV_CODEC_CAP_DELAY,
     .priv_class = &nvenc_class,
     .defaults = nvenc_defaults,
+    .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,
     .pix_fmts = ff_nvenc_pix_fmts,
 };
 #endif
@@ -127,18 +128,19 @@ static const AVClass nvenc_h264_class = {
 };
 
 AVCodec ff_nvenc_h264_encoder = {
-    .name = "nvenc_h264",
-    .long_name = NULL_IF_CONFIG_SMALL("NVIDIA NVENC h264 encoder"),
-    .type = AVMEDIA_TYPE_VIDEO,
-    .id = AV_CODEC_ID_H264,
+    .name           = "nvenc_h264",
+    .long_name      = NULL_IF_CONFIG_SMALL("NVIDIA NVENC h264 encoder"),
+    .type           = AVMEDIA_TYPE_VIDEO,
+    .id             = AV_CODEC_ID_H264,
+    .init           = ff_nvenc_encode_init,
+    .encode2        = ff_nvenc_encode_frame,
+    .close          = ff_nvenc_encode_close,
     .priv_data_size = sizeof(NVENCContext),
-    .init = ff_nvenc_encode_init,
-    .encode2 = ff_nvenc_encode_frame,
-    .close = ff_nvenc_encode_close,
-    .capabilities = AV_CODEC_CAP_DELAY,
-    .priv_class = &nvenc_h264_class,
-    .defaults = nvenc_defaults,
-    .pix_fmts = ff_nvenc_pix_fmts,
+    .priv_class     = &nvenc_h264_class,
+    .defaults       = nvenc_defaults,
+    .capabilities   = AV_CODEC_CAP_DELAY,
+    .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,
+    .pix_fmts       = ff_nvenc_pix_fmts,
 };
 #endif
 

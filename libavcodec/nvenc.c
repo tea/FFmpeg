@@ -293,31 +293,6 @@ static int nvenc_check_cap(AVCodecContext *avctx, NV_ENC_CAPS cap)
     return 0;
 }
 
-static av_cold void nvenc_unload_nvenc(AVCodecContext *avctx)
-{
-    NVENCContext *ctx = avctx->priv_data;
-    NVENCLibraryContext *nvel = &ctx->nvel;
-
-    dlclose(nvel->nvenc);
-    nvel->nvenc = NULL;
-
-#if !CONFIG_CUDA
-    dlclose(nvel->cuda);
-    nvel->cuda = NULL;
-#endif
-
-    nvel->cu_init = NULL;
-    nvel->cu_device_get_count = NULL;
-    nvel->cu_device_get = NULL;
-    nvel->cu_device_get_name = NULL;
-    nvel->cu_device_compute_capability = NULL;
-    nvel->cu_ctx_create = NULL;
-    nvel->cu_ctx_pop_current = NULL;
-    nvel->cu_ctx_destroy = NULL;
-
-    av_log(avctx, AV_LOG_VERBOSE, "Nvenc unloaded\n");
-}
-
 static int nvenc_check_capabilities(AVCodecContext *avctx)
 {
     NVENCContext *ctx = avctx->priv_data;
@@ -1039,10 +1014,10 @@ static av_cold int nvenc_alloc_surface(AVCodecContext *avctx, int idx)
     return 0;
 }
 
-static av_cold int nvenc_setup_frames(AVCodecContext *avctx, int* surfaceCount)
+static av_cold int nvenc_setup_frames(AVCodecContext *avctx)
 {
-    int res;
     NVENCContext *ctx = avctx->priv_data;
+    int i, res;
 
     ctx->frames = av_malloc(ctx->nb_surfaces * sizeof(*ctx->frames));
 
@@ -1060,8 +1035,8 @@ static av_cold int nvenc_setup_frames(AVCodecContext *avctx, int* surfaceCount)
     if (!ctx->ready)
         return AVERROR(ENOMEM);
 
-    for(*surfaceCount = 0; *surfaceCount < ctx->nb_surfaces; ++*surfaceCount) {
-        res = nvenc_alloc_surface(avctx, *surfaceCount);
+    for(i = 0; i < ctx->nb_surfaces; ++i) {
+        res = nvenc_alloc_surface(avctx, i);
         if (res)
             return res;
     }
@@ -1102,15 +1077,71 @@ static av_cold int nvenc_setup_extradata(AVCodecContext *avctx)
     return 0;
 }
 
+av_cold int ff_nvenc_encode_close(AVCodecContext *avctx)
+{
+    NVENCContext *ctx               = avctx->priv_data;
+    NV_ENCODE_API_FUNCTION_LIST *nv = &ctx->nvel.nvenc_funcs;
+    int i;
+
+    /* the encoder has to be flushed before it can be closed */
+    if (ctx->nvenc_ctx) {
+        NV_ENC_PIC_PARAMS params        = { .version        = NV_ENC_PIC_PARAMS_VER,
+                                            .encodePicFlags = NV_ENC_PIC_FLAG_EOS };
+
+        nv->nvEncEncodePicture(ctx->nvenc_ctx, &params);
+    }
+
+    av_fifo_freep(&ctx->timestamps);
+    av_fifo_freep(&ctx->pending);
+    av_fifo_freep(&ctx->ready);
+
+    if (ctx->frames) {
+        if (avctx->pix_fmt == AV_PIX_FMT_CUDA) {
+            for (i = 0; i < ctx->nb_surfaces; ++i) {
+                if (ctx->frames[i].in)
+                    nv->nvEncUnmapInputResource(ctx->nvenc_ctx, ctx->frames[i].in_map.mappedResource);
+            }
+        }
+        for (i = 0; i < ctx->nb_registered_frames; i++) {
+            if (ctx->registered_frames[i].regptr)
+                nv->nvEncUnregisterResource(ctx->nvenc_ctx, ctx->registered_frames[i].regptr);
+        }
+        ctx->nb_registered_frames = 0;
+
+        for (i = 0; i < ctx->nb_surfaces; ++i) {
+            if (avctx->pix_fmt != AV_PIX_FMT_CUDA)
+                nv->nvEncDestroyInputBuffer(ctx->nvenc_ctx, ctx->frames[i].in);
+            av_frame_free(&ctx->frames[i].in_ref);
+            nv->nvEncDestroyBitstreamBuffer(ctx->nvenc_ctx, ctx->frames[i].out);
+        }
+    }
+    av_freep(&ctx->frames);
+
+    if (ctx->nvenc_ctx)
+        nv->nvEncDestroyEncoder(ctx->nvenc_ctx);
+    ctx->nvenc_ctx = NULL;
+
+    if (ctx->cu_context_internal)
+        ctx->nvel.cu_ctx_destroy(ctx->cu_context_internal);
+    ctx->cu_context = ctx->cu_context_internal = NULL;
+
+    if (ctx->nvel.nvenc)
+        dlclose(ctx->nvel.nvenc);
+    ctx->nvel.nvenc = NULL;
+
+#if !CONFIG_CUDA
+    if (ctx->nvel.cuda)
+        dlclose(ctx->nvel.cuda);
+    ctx->nvel.cuda = NULL;
+#endif
+
+    return 0;
+}
+
 av_cold int ff_nvenc_encode_init(AVCodecContext *avctx)
 {
     NVENCContext *ctx = avctx->priv_data;
-    NVENCLibraryContext *nvel = &ctx->nvel;
-    NV_ENCODE_API_FUNCTION_LIST *nv = &nvel->nvenc_funcs;
-
     int ret;
-    int i;
-    int surfaceCount = 0;
 
     if (avctx->pix_fmt == AV_PIX_FMT_CUDA) {
         AVHWFramesContext *frames_ctx;
@@ -1129,88 +1160,18 @@ av_cold int ff_nvenc_encode_init(AVCodecContext *avctx)
         return ret;
 
     if ((ret = nvenc_setup_device(avctx)) < 0)
-        goto error;
+        return ret;
 
     if ((ret = nvenc_setup_encoder(avctx)) < 0)
-        goto error;
+        return ret;
 
-    if ((nvenc_setup_frames(avctx, &surfaceCount)) < 0)
-        goto error;
+    if ((ret = nvenc_setup_frames(avctx)) < 0)
+        return ret;
 
     if (avctx->flags & AV_CODEC_FLAG_GLOBAL_HEADER) {
         if ((ret = nvenc_setup_extradata(avctx)) < 0)
-            goto error;
+            return ret;
     }
-
-    return 0;
-
-error:
-    av_fifo_freep(&ctx->timestamps);
-    av_fifo_freep(&ctx->ready);
-    av_fifo_freep(&ctx->pending);
-
-    for (i = 0; i < surfaceCount; ++i) {
-        if (avctx->pix_fmt != AV_PIX_FMT_CUDA)
-            nv->nvEncDestroyInputBuffer(ctx->nvenc_ctx, ctx->frames[i].in);
-        av_frame_free(&ctx->frames[i].in_ref);
-        nv->nvEncDestroyBitstreamBuffer(ctx->nvenc_ctx, ctx->frames[i].out);
-    }
-    av_freep(&ctx->frames);
-
-    if (ctx->nvenc_ctx)
-        nv->nvEncDestroyEncoder(ctx->nvenc_ctx);
-    ctx->nvenc_ctx = NULL;
-
-    if (ctx->cu_context_internal)
-        nvel->cu_ctx_destroy(ctx->cu_context_internal);
-    ctx->cu_context = ctx->cu_context_internal = NULL;
-
-    nvenc_unload_nvenc(avctx);
-
-    return ret;
-}
-
-av_cold int ff_nvenc_encode_close(AVCodecContext *avctx)
-{
-    NVENCContext *ctx = avctx->priv_data;
-    NVENCLibraryContext *nvel = &ctx->nvel;
-    NV_ENCODE_API_FUNCTION_LIST *nv = &nvel->nvenc_funcs;
-    int i;
-
-    av_fifo_freep(&ctx->timestamps);
-    av_fifo_freep(&ctx->ready);
-    av_fifo_freep(&ctx->pending);
-
-    if (avctx->pix_fmt == AV_PIX_FMT_CUDA) {
-        for (i = 0; i < ctx->nb_surfaces; ++i) {
-            if (ctx->frames[i].in) {
-                 nv->nvEncUnmapInputResource(ctx->nvenc_ctx, ctx->frames[i].in_map.mappedResource);
-            }
-        }
-        for (i = 0; i < ctx->nb_registered_frames; i++) {
-            if (ctx->registered_frames[i].regptr)
-                nv->nvEncUnregisterResource(ctx->nvenc_ctx, ctx->registered_frames[i].regptr);
-        }
-        ctx->nb_registered_frames = 0;
-    }
-
-    for (i = 0; i < ctx->nb_surfaces; ++i) {
-        if (avctx->pix_fmt != AV_PIX_FMT_CUDA)
-            nv->nvEncDestroyInputBuffer(ctx->nvenc_ctx, ctx->frames[i].in);
-        av_frame_free(&ctx->frames[i].in_ref);
-        nv->nvEncDestroyBitstreamBuffer(ctx->nvenc_ctx, ctx->frames[i].out);
-    }
-    av_freep(&ctx->frames);
-    ctx->nb_surfaces = 0;
-
-    nv->nvEncDestroyEncoder(ctx->nvenc_ctx);
-    ctx->nvenc_ctx = NULL;
-
-    if (ctx->cu_context_internal)
-        nvel->cu_ctx_destroy(ctx->cu_context_internal);
-    ctx->cu_context = ctx->cu_context_internal = NULL;
-
-    nvenc_unload_nvenc(avctx);
 
     return 0;
 }
