@@ -77,20 +77,46 @@ static const AVOption options[] = {
     { NULL }
 };
 
-static const AVCodecDefault nvenc_defaults[] = {
-    { "b", "2M" },
+static const AVClass nvenc_hevc_class = {
+    .class_name = "nvenc_hevc",
+    .item_name = av_default_item_name,
+    .option = options,
+    .version = LIBAVUTIL_VERSION_INT,
+};
+
+static const AVCodecDefault defaults[] = {
+    { "b", "0" },
     { "qmin", "-1" },
     { "qmax", "-1" },
     { "qdiff", "-1" },
     { "qblur", "-1" },
     { "qcomp", "-1" },
-    { "g", "250" },
-    { "bf", "0" },
     { NULL },
 };
 
-#if CONFIG_NVENC_HEVC_ENCODER
-static const AVClass nvenc_hevc_class = {
+AVCodec ff_hevc_nvenc_encoder = {
+    .name           = "hevc_nvenc",
+    .long_name      = NULL_IF_CONFIG_SMALL("NVIDIA NVENC HEVC encoder"),
+    .type           = AVMEDIA_TYPE_VIDEO,
+    .id             = AV_CODEC_ID_HEVC,
+    .init           = ff_nvenc_encode_init,
+    .encode2        = ff_nvenc_encode_frame,
+    .close          = ff_nvenc_encode_close,
+    .priv_data_size = sizeof(NVENCContext),
+    .priv_class     = &nvenc_hevc_class,
+    .defaults       = defaults,
+    .pix_fmts       = ff_nvenc_pix_fmts,
+    .capabilities   = AV_CODEC_CAP_DELAY,
+    .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,
+};
+
+static int nvenc_old_init(AVCodecContext *avctx)
+{
+    av_log(avctx, AV_LOG_WARNING, "This encoder is deprecated, use 'hevc_nvenc' instead\n");
+    return ff_nvenc_encode_init(avctx);
+}
+
+static const AVClass nvenc_hevc_old_class = {
     .class_name = "nvenc_hevc",
     .item_name = av_default_item_name,
     .option = options,
@@ -99,17 +125,16 @@ static const AVClass nvenc_hevc_class = {
 
 AVCodec ff_nvenc_hevc_encoder = {
     .name           = "nvenc_hevc",
-    .long_name      = NULL_IF_CONFIG_SMALL("NVIDIA NVENC hevc encoder"),
+    .long_name      = NULL_IF_CONFIG_SMALL("NVIDIA NVENC HEVC encoder"),
     .type           = AVMEDIA_TYPE_VIDEO,
-    .id             = AV_CODEC_ID_H265,
-    .init           = ff_nvenc_encode_init,
+    .id             = AV_CODEC_ID_HEVC,
+    .init           = nvenc_old_init,
     .encode2        = ff_nvenc_encode_frame,
     .close          = ff_nvenc_encode_close,
     .priv_data_size = sizeof(NVENCContext),
-    .priv_class     = &nvenc_hevc_class,
-    .defaults       = nvenc_defaults,
+    .priv_class     = &nvenc_hevc_old_class,
+    .defaults       = defaults,
     .pix_fmts       = ff_nvenc_pix_fmts,
     .capabilities   = AV_CODEC_CAP_DELAY,
     .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,
 };
-#endif

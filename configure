@@ -2646,6 +2646,8 @@ wmv3_vdpau_decoder_select="vc1_vdpau_decoder"
 wmv3_vdpau_hwaccel_select="vc1_vdpau_hwaccel"
 
 # hardware-accelerated codecs
+nvenc_deps_any="dlopen LoadLibrary"
+nvenc_extralibs='$ldl'
 omx_deps="dlopen pthreads"
 omx_extralibs='$ldl'
 qsvdec_select="qsv"
@@ -2655,7 +2657,8 @@ vaapi_encode_deps="vaapi"
 hwupload_cuda_filter_deps="cuda"
 scale_npp_filter_deps="cuda libnpp"
 
-nvenc_encoder_deps="nvenc"
+h264_nvenc_encoder_deps="nvenc"
+nvenc_h264_encoder_deps="nvenc"
 h264_qsv_decoder_deps="libmfx"
 h264_qsv_decoder_select="h264_mp4toannexb_bsf h264_parser qsvdec h264_qsv_hwaccel"
 h264_qsv_encoder_deps="libmfx"
@@ -2673,7 +2676,7 @@ mpeg2_qsv_decoder_deps="libmfx"
 mpeg2_qsv_decoder_select="qsvdec mpeg2_qsv_hwaccel"
 mpeg2_qsv_encoder_deps="libmfx"
 mpeg2_qsv_encoder_select="qsvenc"
-nvenc_h264_encoder_deps="nvenc"
+hevc_nvenc_encoder_deps="nvenc"
 nvenc_hevc_encoder_deps="nvenc"
 
 # parsers
