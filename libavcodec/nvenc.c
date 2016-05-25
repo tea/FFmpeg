@@ -1554,12 +1554,6 @@ int ff_nvenc_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
         }
 
         nvenc_codec_specific_pic_params(avctx, &params);
-
-        ret = nvenc_enqueue_timestamp(ctx->timestamps, frame->pts);
-        if (ret < 0) {
-            nvenc_frame->locked = 0;
-            return ret;
-        }
     } else {
         params.encodePicFlags = NV_ENC_PIC_FLAG_EOS;
     }
@@ -1572,6 +1566,11 @@ int ff_nvenc_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
     }
 
     if (nvenc_frame) {
+        ret = nvenc_enqueue_timestamp(ctx->timestamps, frame->pts);
+        if (ret < 0) {
+            nvenc_frame->locked = 0;
+            return ret;
+        }
         ret = av_fifo_generic_write(ctx->pending, &nvenc_frame, sizeof(nvenc_frame), NULL);
         if (ret < 0)
             return ret;
