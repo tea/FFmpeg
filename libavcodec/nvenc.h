@@ -76,6 +76,11 @@ typedef NVENCSTATUS (NVENCAPI *PNVENCODEAPICREATEINSTANCE)(NV_ENCODE_API_FUNCTIO
 
 typedef struct NVENCLibraryContext
 {
+#if !CONFIG_CUDA
+    void *cuda;
+#endif
+    void *nvenc;
+
     PCUINIT cu_init;
     PCUDEVICEGETCOUNT cu_device_get_count;
     PCUDEVICEGET cu_device_get;
@@ -86,21 +91,6 @@ typedef struct NVENCLibraryContext
     PCUCTXDESTROY cu_ctx_destroy;
 
     NV_ENCODE_API_FUNCTION_LIST nvenc_funcs;
-    int nvenc_device_count;
-    CUdevice nvenc_devices[16];
-
-#if !CONFIG_CUDA
-#if defined(_WIN32)
-    HMODULE cuda_lib;
-#else
-    void* cuda_lib;
-#endif
-#endif
-#if defined(_WIN32)
-    HMODULE nvenc_lib;
-#else
-    void* nvenc_lib;
-#endif
 } NVENCLibraryContext;
 
 enum {
@@ -128,6 +118,10 @@ enum {
     NVENC_LOSSLESS   = 2
 };
 
+enum {
+    LIST_DEVICES = -2,
+    ANY_DEVICE,
+};
 
 typedef struct NVENCContext
 {
@@ -166,7 +160,7 @@ typedef struct NVENCContext
     int level;
     int tier;
     int rc;
-    int gpu;
+    int device;
     int flags;
     int buffer_delay;
 } NVENCContext;

@@ -23,10 +23,25 @@
 
 #include <nvEncodeAPI.h>
 
-#if defined(_WIN32)
+#if HAVE_WINDOWS_H
 #include <windows.h>
+
+#define CUDA_LIBNAME TEXT("nvcuda.dll")
+#if ARCH_X86_64
+#define NVENC_LIBNAME "nvEncodeAPI64.dll"
+#else
+#define NVENC_LIBNAME "nvEncodeAPI.dll"
+#endif
+
+#define dlopen(filename, flags) LoadLibrary((filename))
+#define dlsym(handle, symbol)   GetProcAddress(handle, symbol)
+#define dlclose(handle)         FreeLibrary(handle)
+
 #else
 #include <dlfcn.h>
+
+#define CUDA_LIBNAME "libcuda.so"
+#define NVENC_LIBNAME "libnvidia-encode.so"
 #endif
 
 #include "libavutil/internal.h"
@@ -42,17 +57,32 @@
 #include "libavutil/hwcontext_cuda.h"
 #endif
 
+#define NVENC_CAP 0x30
 #define IS_CBR(rc) (rc == NV_ENC_PARAMS_RC_CBR ||               \
                     rc == NV_ENC_PARAMS_RC_2_PASS_QUALITY ||    \
                     rc == NV_ENC_PARAMS_RC_2_PASS_FRAMESIZE_CAP)
 
-#if defined(_WIN32)
-#define LOAD_FUNC(l, s) GetProcAddress(l, s)
-#define DL_CLOSE_FUNC(l) FreeLibrary(l)
-#else
-#define LOAD_FUNC(l, s) dlsym(l, s)
-#define DL_CLOSE_FUNC(l) dlclose(l)
-#endif
+#define LOAD_LIBRARY(l, path)                   \
+    do {                                        \
+        if (!((l) = dlopen(path, RTLD_LAZY))) { \
+            av_log(avctx, AV_LOG_ERROR,         \
+                   "Cannot load %s\n",          \
+                   path);                       \
+            res = AVERROR_UNKNOWN;              \
+            goto error;                         \
+        }                                       \
+    } while (0)
+
+#define LOAD_SYMBOL(fun, lib, symbol)        \
+    do {                                     \
+        if (!((fun) = dlsym(lib, symbol))) { \
+            av_log(avctx, AV_LOG_ERROR,      \
+                   "Cannot load %s\n",       \
+                   symbol);                  \
+            res = AVERROR_UNKNOWN;           \
+            goto error;                      \
+        }                                    \
+    } while (0)
 
 typedef struct NvencData
 {
@@ -130,19 +160,13 @@ static int nvenc_print_error(void *log_ctx, NVENCSTATUS err,
     return ret;
 }
 
-#define CHECK_LOAD_FUNC(t, f, s) \
-do { \
-    (f) = (t)LOAD_FUNC(nvel->cuda_lib, s); \
-    if (!(f)) { \
-        av_log(avctx, AV_LOG_FATAL, "Failed loading %s from CUDA library\n", s); \
-        goto error; \
-    } \
-} while (0)
-
-static av_cold int nvenc_dyload_cuda(AVCodecContext *avctx)
+static av_cold int nvenc_load_libraries(AVCodecContext *avctx)
 {
     NVENCContext *ctx         = avctx->priv_data;
     NVENCLibraryContext *nvel = &ctx->nvel;
+    PNVENCODEAPICREATEINSTANCE nvenc_create_instance;
+    NVENCSTATUS err;
+    int res;
 
 #if CONFIG_CUDA
     nvel->cu_init                      = cuInit;
@@ -153,43 +177,46 @@ static av_cold int nvenc_dyload_cuda(AVCodecContext *avctx)
     nvel->cu_ctx_create                = cuCtxCreate_v2;
     nvel->cu_ctx_pop_current           = cuCtxPopCurrent_v2;
     nvel->cu_ctx_destroy               = cuCtxDestroy_v2;
-
-    return 1;
 #else
-    if (nvel->cuda_lib)
-        return 1;
+    LOAD_LIBRARY(nvel->cuda, CUDA_LIBNAME);
 
-#if defined(_WIN32)
-    nvel->cuda_lib = LoadLibrary(TEXT("nvcuda.dll"));
-#else
-    nvel->cuda_lib = dlopen("libcuda.so", RTLD_LAZY);
+    LOAD_SYMBOL(nvel->cu_init, nvel->cuda, "cuInit");
+    LOAD_SYMBOL(nvel->cu_device_get_count, nvel->cuda, "cuDeviceGetCount");
+    LOAD_SYMBOL(nvel->cu_device_get, nvel->cuda, "cuDeviceGet");
+    LOAD_SYMBOL(nvel->cu_device_get_name, nvel->cuda, "cuDeviceGetName");
+    LOAD_SYMBOL(nvel->cu_device_compute_capability, nvel->cuda,
+                "cuDeviceComputeCapability");
+    LOAD_SYMBOL(nvel->cu_ctx_create, nvel->cuda, "cuCtxCreate_v2");
+    LOAD_SYMBOL(nvel->cu_ctx_pop_current, nvel->cuda, "cuCtxPopCurrent_v2");
+    LOAD_SYMBOL(nvel->cu_ctx_destroy, nvel->cuda, "cuCtxDestroy_v2");
 #endif
 
-    if (!nvel->cuda_lib) {
-        av_log(avctx, AV_LOG_FATAL, "Failed loading CUDA library\n");
+    LOAD_LIBRARY(nvel->nvenc, NVENC_LIBNAME);
+
+    LOAD_SYMBOL(nvenc_create_instance, nvel->nvenc,
+                "NvEncodeAPICreateInstance");
+
+    nvel->nvenc_funcs.version = NV_ENCODE_API_FUNCTION_LIST_VER;
+
+    err = nvenc_create_instance(&nvel->nvenc_funcs);
+    if (err != NV_ENC_SUCCESS) {
+        nvenc_print_error(avctx, err, "Cannot create the NVENC instance");
         goto error;
     }
 
-    CHECK_LOAD_FUNC(PCUINIT, nvel->cu_init, "cuInit");
-    CHECK_LOAD_FUNC(PCUDEVICEGETCOUNT, nvel->cu_device_get_count, "cuDeviceGetCount");
-    CHECK_LOAD_FUNC(PCUDEVICEGET, nvel->cu_device_get, "cuDeviceGet");
-    CHECK_LOAD_FUNC(PCUDEVICEGETNAME, nvel->cu_device_get_name, "cuDeviceGetName");
-    CHECK_LOAD_FUNC(PCUDEVICECOMPUTECAPABILITY, nvel->cu_device_compute_capability, "cuDeviceComputeCapability");
-    CHECK_LOAD_FUNC(PCUCTXCREATE, nvel->cu_ctx_create, "cuCtxCreate_v2");
-    CHECK_LOAD_FUNC(PCUCTXPOPCURRENT, nvel->cu_ctx_pop_current, "cuCtxPopCurrent_v2");
-    CHECK_LOAD_FUNC(PCUCTXDESTROY, nvel->cu_ctx_destroy, "cuCtxDestroy_v2");
-
-    return 1;
+    return 0;
 
 error:
-
-    if (nvel->cuda_lib)
-        DL_CLOSE_FUNC(nvel->cuda_lib);
-
-    nvel->cuda_lib = NULL;
-
-    return 0;
+    if (nvel->nvenc)
+        dlclose(nvel->nvenc);
+    nvel->nvenc = NULL;
+#if !CONFIG_CUDA
+    if (nvel->cuda)
+        dlclose(nvel->cuda);
+    nvel->cuda = NULL;
 #endif
+
+    return res;
 }
 
 static av_cold int nvenc_open_session(AVCodecContext *avctx)
@@ -207,146 +234,62 @@ static av_cold int nvenc_open_session(AVCodecContext *avctx)
     ret = nv->nvEncOpenEncodeSessionEx(&params, &ctx->nvenc_ctx);
     if (ret != NV_ENC_SUCCESS) {
         ctx->nvenc_ctx = NULL;
-        return nvenc_print_error(avctx, ret, "OpenEncodeSessionEx failed");
+        return nvenc_print_error(avctx, ret, "Cannot open the NVENC Session");
     }
 
     return 0;
 }
 
-static av_cold int check_cuda_errors(AVCodecContext *avctx, CUresult err, const char *func)
+static int nvenc_check_codec_support(AVCodecContext *avctx)
 {
-    if (err != CUDA_SUCCESS) {
-        av_log(avctx, AV_LOG_FATAL, ">> %s - failed with error code 0x%x\n", func, err);
-        return 0;
-    }
-    return 1;
-}
-#define check_cuda_errors(f) if (!check_cuda_errors(avctx, f, #f)) goto error
+    NVENCContext *ctx               = avctx->priv_data;
+    NV_ENCODE_API_FUNCTION_LIST *nv = &ctx->nvel.nvenc_funcs;
+    int i, ret, count = 0;
+    GUID *guids = NULL;
 
-static av_cold int nvenc_check_cuda(AVCodecContext *avctx)
-{
-    int device_count = 0;
-    CUdevice cu_device = 0;
-    char gpu_name[128];
-    int smminor = 0, smmajor = 0;
-    int i, smver, target_smver;
+    ret = nv->nvEncGetEncodeGUIDCount(ctx->nvenc_ctx, &count);
 
-    NVENCContext *ctx = avctx->priv_data;
-    NVENCLibraryContext *nvel = &ctx->nvel;
+    if (ret != NV_ENC_SUCCESS || !count)
+        return AVERROR(ENOSYS);
 
-    switch (avctx->codec->id) {
-    case AV_CODEC_ID_H264:
-        target_smver = ctx->data_pix_fmt == AV_PIX_FMT_YUV444P ? 0x52 : 0x30;
-        break;
-    case AV_CODEC_ID_H265:
-        target_smver = 0x52;
-        break;
-    default:
-        av_log(avctx, AV_LOG_FATAL, "Unknown codec name\n");
-        goto error;
+    guids = av_malloc(count * sizeof(GUID));
+    if (!guids)
+        return AVERROR(ENOMEM);
+
+    ret = nv->nvEncGetEncodeGUIDs(ctx->nvenc_ctx, guids, count, &count);
+    if (ret != NV_ENC_SUCCESS) {
+        ret = AVERROR(ENOSYS);
+        goto fail;
     }
 
-    if (!nvenc_dyload_cuda(avctx))
-        return 0;
-
-    if (nvel->nvenc_device_count > 0)
-        return 1;
-
-    check_cuda_errors(nvel->cu_init(0));
-
-    check_cuda_errors(nvel->cu_device_get_count(&device_count));
-
-    if (!device_count) {
-        av_log(avctx, AV_LOG_FATAL, "No CUDA capable devices found\n");
-        goto error;
+    ret = AVERROR(ENOSYS);
+    for (i = 0; i < count; i++) {
+        if (!memcmp(&guids[i], &ctx->params.encodeGUID, sizeof(*guids))) {
+            ret = 0;
+            break;
+        }
     }
 
-    av_log(avctx, AV_LOG_VERBOSE, "%d CUDA capable devices found\n", device_count);
+fail:
+    av_free(guids);
 
-    nvel->nvenc_device_count = 0;
-
-    for (i = 0; i < device_count; ++i) {
-        check_cuda_errors(nvel->cu_device_get(&cu_device, i));
-        check_cuda_errors(nvel->cu_device_get_name(gpu_name, sizeof(gpu_name), cu_device));
-        check_cuda_errors(nvel->cu_device_compute_capability(&smmajor, &smminor, cu_device));
-
-        smver = (smmajor << 4) | smminor;
-
-        av_log(avctx, AV_LOG_VERBOSE, "[ GPU #%d - < %s > has Compute SM %d.%d, NVENC %s ]\n", i, gpu_name, smmajor, smminor, (smver >= target_smver) ? "Available" : "Not Available");
-
-        if (smver >= target_smver)
-            nvel->nvenc_devices[nvel->nvenc_device_count++] = cu_device;
-    }
-
-    if (!nvel->nvenc_device_count) {
-        av_log(avctx, AV_LOG_FATAL, "No NVENC capable devices found\n");
-        goto error;
-    }
-
-    return 1;
-
-error:
-
-    nvel->nvenc_device_count = 0;
-
-    return 0;
+    return ret;
 }
 
-static av_cold int nvenc_dyload_nvenc(AVCodecContext *avctx)
+static int nvenc_check_cap(AVCodecContext *avctx, NV_ENC_CAPS cap)
 {
-    PNVENCODEAPICREATEINSTANCE nvEncodeAPICreateInstance = 0;
-    NVENCSTATUS nvstatus;
+    NVENCContext *ctx               = avctx->priv_data;
+    NV_ENCODE_API_FUNCTION_LIST *nv = &ctx->nvel.nvenc_funcs;
+    NV_ENC_CAPS_PARAM params        = { 0 };
+    int ret, val = 0;
 
-    NVENCContext *ctx = avctx->priv_data;
-    NVENCLibraryContext *nvel = &ctx->nvel;
+    params.version     = NV_ENC_CAPS_PARAM_VER;
+    params.capsToQuery = cap;
 
-    if (!nvenc_check_cuda(avctx))
-        return 0;
+    ret = nv->nvEncGetEncodeCaps(ctx->nvenc_ctx, ctx->params.encodeGUID, &params, &val);
 
-    if (nvel->nvenc_lib)
-        return 1;
-
-#if defined(_WIN32)
-    if (sizeof(void*) == 8) {
-        nvel->nvenc_lib = LoadLibrary(TEXT("nvEncodeAPI64.dll"));
-    } else {
-        nvel->nvenc_lib = LoadLibrary(TEXT("nvEncodeAPI.dll"));
-    }
-#else
-    nvel->nvenc_lib = dlopen("libnvidia-encode.so.1", RTLD_LAZY);
-#endif
-
-    if (!nvel->nvenc_lib) {
-        av_log(avctx, AV_LOG_FATAL, "Failed loading the nvenc library\n");
-        goto error;
-    }
-
-    nvEncodeAPICreateInstance = (PNVENCODEAPICREATEINSTANCE)LOAD_FUNC(nvel->nvenc_lib, "NvEncodeAPICreateInstance");
-
-    if (!nvEncodeAPICreateInstance) {
-        av_log(avctx, AV_LOG_FATAL, "Failed to load nvenc entrypoint\n");
-        goto error;
-    }
-
-    nvel->nvenc_funcs.version = NV_ENCODE_API_FUNCTION_LIST_VER;
-
-    nvstatus = nvEncodeAPICreateInstance(&nvel->nvenc_funcs);
-
-    if (nvstatus != NV_ENC_SUCCESS) {
-        nvenc_print_error(avctx, nvstatus, "Failed to create nvenc instance");
-        goto error;
-    }
-
-    av_log(avctx, AV_LOG_VERBOSE, "Nvenc initialized successfully\n");
-
-    return 1;
-
-error:
-    if (nvel->nvenc_lib)
-        DL_CLOSE_FUNC(nvel->nvenc_lib);
-
-    nvel->nvenc_lib = NULL;
-
+    if (ret == NV_ENC_SUCCESS)
+        return val;
     return 0;
 }
 
@@ -355,14 +298,12 @@ static av_cold void nvenc_unload_nvenc(AVCodecContext *avctx)
     NVENCContext *ctx = avctx->priv_data;
     NVENCLibraryContext *nvel = &ctx->nvel;
 
-    DL_CLOSE_FUNC(nvel->nvenc_lib);
-    nvel->nvenc_lib = NULL;
-
-    nvel->nvenc_device_count = 0;
+    dlclose(nvel->nvenc);
+    nvel->nvenc = NULL;
 
 #if !CONFIG_CUDA
-    DL_CLOSE_FUNC(nvel->cuda_lib);
-    nvel->cuda_lib = NULL;
+    dlclose(nvel->cuda);
+    nvel->cuda = NULL;
 #endif
 
     nvel->cu_init = NULL;
@@ -377,13 +318,123 @@ static av_cold void nvenc_unload_nvenc(AVCodecContext *avctx)
     av_log(avctx, AV_LOG_VERBOSE, "Nvenc unloaded\n");
 }
 
+static int nvenc_check_capabilities(AVCodecContext *avctx)
+{
+    NVENCContext *ctx = avctx->priv_data;
+    int ret;
+
+    ret = nvenc_check_codec_support(avctx);
+    if (ret < 0) {
+        av_log(avctx, AV_LOG_VERBOSE, "Codec not supported\n");
+        return ret;
+    }
+
+    ret = nvenc_check_cap(avctx, NV_ENC_CAPS_SUPPORT_YUV444_ENCODE);
+    if (ctx->data_pix_fmt == AV_PIX_FMT_YUV444P && ret <= 0) {
+        av_log(avctx, AV_LOG_VERBOSE, "YUV444P not supported\n");
+        return AVERROR(ENOSYS);
+    }
+
+    ret = nvenc_check_cap(avctx, NV_ENC_CAPS_WIDTH_MAX);
+    if (ret < avctx->width) {
+        av_log(avctx, AV_LOG_VERBOSE, "Width %d exceeds %d\n",
+               avctx->width, ret);
+        return AVERROR(ENOSYS);
+    }
+
+    ret = nvenc_check_cap(avctx, NV_ENC_CAPS_HEIGHT_MAX);
+    if (ret < avctx->height) {
+        av_log(avctx, AV_LOG_VERBOSE, "Height %d exceeds %d\n",
+               avctx->height, ret);
+        return AVERROR(ENOSYS);
+    }
+
+    ret = nvenc_check_cap(avctx, NV_ENC_CAPS_NUM_MAX_BFRAMES);
+    if (ret < avctx->max_b_frames) {
+        av_log(avctx, AV_LOG_VERBOSE, "Max b-frames %d exceed %d\n",
+               avctx->max_b_frames, ret);
+
+        return AVERROR(ENOSYS);
+    }
+
+    return 0;
+}
+
+static int nvenc_check_device(AVCodecContext *avctx, int idx)
+{
+    NVENCContext *ctx               = avctx->priv_data;
+    NVENCLibraryContext *nvel       = &ctx->nvel;
+    char name[128]                  = { 0 };
+    int major, minor, ret;
+    CUdevice cu_device;
+    CUcontext dummy;
+    int loglevel = AV_LOG_VERBOSE;
+
+    if (ctx->device == LIST_DEVICES)
+        loglevel = AV_LOG_INFO;
+
+    ret = nvel->cu_device_get(&cu_device, idx);
+    if (ret != CUDA_SUCCESS) {
+        av_log(avctx, AV_LOG_ERROR,
+               "Cannot access the CUDA device %d\n",
+               idx);
+        return -1;
+    }
+
+    ret = nvel->cu_device_get_name(name, sizeof(name), cu_device);
+    if (ret != CUDA_SUCCESS)
+        return -1;
+
+    ret = nvel->cu_device_compute_capability(&major, &minor, cu_device);
+    if (ret != CUDA_SUCCESS)
+        return -1;
+
+    av_log(avctx, loglevel, "Device %d [%s] ", cu_device, name);
+
+    if (((major << 4) | minor) < NVENC_CAP)
+        goto fail;
+
+    ret = nvel->cu_ctx_create(&ctx->cu_context_internal, 0, cu_device);
+    if (ret != CUDA_SUCCESS)
+        goto fail;
+
+    ctx->cu_context = ctx->cu_context_internal;
+
+    ret = nvel->cu_ctx_pop_current(&dummy);
+    if (ret != CUDA_SUCCESS)
+        goto fail2;
+
+    if ((ret = nvenc_open_session(avctx)) < 0)
+        goto fail2;
+
+    if ((ret = nvenc_check_capabilities(avctx)) < 0)
+        goto fail3;
+
+    av_log(avctx, loglevel, "supports NVENC\n");
+
+    if (ctx->device == cu_device || ctx->device == ANY_DEVICE)
+        return 0;
+
+fail3:
+    nvel->nvenc_funcs.nvEncDestroyEncoder(ctx->nvenc_ctx);
+    ctx->nvenc_ctx = NULL;
+
+fail2:
+    nvel->cu_ctx_destroy(ctx->cu_context_internal);
+    ctx->cu_context_internal = NULL;
+
+fail:
+    if (ret != 0)
+        av_log(avctx, loglevel, "does not support NVENC (major %d minor %d)\n",
+               major, minor);
+
+    return AVERROR(ENOSYS);
+}
+
 static av_cold int nvenc_setup_device(AVCodecContext *avctx)
 {
     NVENCContext *ctx         = avctx->priv_data;
     NVENCLibraryContext *nvel = &ctx->nvel;
-
-    CUresult cu_res;
-    CUcontext cu_context_curr;
 
     switch (avctx->codec->id) {
     case AV_CODEC_ID_H264:
@@ -396,48 +447,56 @@ static av_cold int nvenc_setup_device(AVCodecContext *avctx)
         return AVERROR_BUG;
     }
 
-    ctx->data_pix_fmt = avctx->pix_fmt;
-
-#if CONFIG_CUDA
     if (avctx->pix_fmt == AV_PIX_FMT_CUDA) {
+#if CONFIG_CUDA
         AVHWFramesContext   *frames_ctx;
         AVCUDADeviceContext *device_hwctx;
+        int ret;
 
-        if (!avctx->hw_frames_ctx) {
-            av_log(avctx, AV_LOG_ERROR, "hw_frames_ctx must be set when using GPU frames as input\n");
+        if (!avctx->hw_frames_ctx)
             return AVERROR(EINVAL);
-        }
 
         frames_ctx   = (AVHWFramesContext*)avctx->hw_frames_ctx->data;
         device_hwctx = frames_ctx->device_ctx->hwctx;
 
         ctx->cu_context = device_hwctx->cuda_ctx;
-        ctx->data_pix_fmt = frames_ctx->sw_format;
-        return 0;
-    }
+
+        ret = nvenc_open_session(avctx);
+        if (ret < 0)
+            return ret;
+
+        ret = nvenc_check_capabilities(avctx);
+        if (ret < 0)
+            return ret;
+#else
+        return AVERROR_BUG;
 #endif
+    } else {
+        int i, nb_devices = 0;
 
-    if (ctx->gpu >= nvel->nvenc_device_count) {
-        av_log(avctx, AV_LOG_FATAL, "Requested GPU %d, but only %d GPUs are available!\n", ctx->gpu, nvel->nvenc_device_count);
-        return AVERROR(EINVAL);
+        if ((nvel->cu_init(0)) != CUDA_SUCCESS) {
+            av_log(avctx, AV_LOG_ERROR,
+                   "Cannot init CUDA\n");
+            return AVERROR_UNKNOWN;
+        }
+
+        if ((nvel->cu_device_get_count(&nb_devices)) != CUDA_SUCCESS) {
+            av_log(avctx, AV_LOG_ERROR,
+                   "Cannot enumerate the CUDA devices\n");
+            return AVERROR_UNKNOWN;
+        }
+
+
+        for (i = 0; i < nb_devices; ++i) {
+            if ((nvenc_check_device(avctx, i)) >= 0 && ctx->device != LIST_DEVICES)
+                return 0;
+        }
+
+        if (ctx->device == LIST_DEVICES)
+            return AVERROR_EXIT;
+
+        return AVERROR(ENOSYS);
     }
-
-    ctx->cu_context = NULL;
-    cu_res = nvel->cu_ctx_create(&ctx->cu_context_internal, 4, nvel->nvenc_devices[ctx->gpu]); // CU_CTX_SCHED_BLOCKING_SYNC=4, avoid CPU spins
-
-    if (cu_res != CUDA_SUCCESS) {
-        av_log(avctx, AV_LOG_FATAL, "Failed creating CUDA context for NVENC: 0x%x\n", (int)cu_res);
-        return AVERROR_EXTERNAL;
-    }
-
-    cu_res = nvel->cu_ctx_pop_current(&cu_context_curr);
-
-    if (cu_res != CUDA_SUCCESS) {
-        av_log(avctx, AV_LOG_FATAL, "Failed popping CUDA context: 0x%x\n", (int)cu_res);
-        return AVERROR_EXTERNAL;
-    }
-
-    ctx->cu_context = ctx->cu_context_internal;
 
     return 0;
 }
@@ -1049,32 +1108,37 @@ av_cold int ff_nvenc_encode_init(AVCodecContext *avctx)
     NVENCLibraryContext *nvel = &ctx->nvel;
     NV_ENCODE_API_FUNCTION_LIST *nv = &nvel->nvenc_funcs;
 
-    int res;
+    int ret;
     int i;
     int surfaceCount = 0;
 
-    if (!nvenc_dyload_nvenc(avctx))
-        return AVERROR_EXTERNAL;
+    if (avctx->pix_fmt == AV_PIX_FMT_CUDA) {
+        AVHWFramesContext *frames_ctx;
+        if (!avctx->hw_frames_ctx) {
+            av_log(avctx, AV_LOG_ERROR,
+                   "hw_frames_ctx must be set when using GPU frames as input\n");
+            return AVERROR(EINVAL);
+        }
+        frames_ctx = (AVHWFramesContext*)avctx->hw_frames_ctx->data;
+        ctx->data_pix_fmt = frames_ctx->sw_format;
+    } else {
+        ctx->data_pix_fmt = avctx->pix_fmt;
+    }
 
-    res = nvenc_setup_device(avctx);
-    if (res)
+    if ((ret = nvenc_load_libraries(avctx)) < 0)
+        return ret;
+
+    if ((ret = nvenc_setup_device(avctx)) < 0)
         goto error;
 
-    res = nvenc_open_session(avctx);
-    if (res)
+    if ((ret = nvenc_setup_encoder(avctx)) < 0)
         goto error;
 
-    res = nvenc_setup_encoder(avctx);
-    if (res)
-        goto error;
-
-    res = nvenc_setup_frames(avctx, &surfaceCount);
-    if (res)
+    if ((nvenc_setup_frames(avctx, &surfaceCount)) < 0)
         goto error;
 
     if (avctx->flags & AV_CODEC_FLAG_GLOBAL_HEADER) {
-        res = nvenc_setup_extradata(avctx);
-        if (res)
+        if ((ret = nvenc_setup_extradata(avctx)) < 0)
             goto error;
     }
 
@@ -1103,7 +1167,7 @@ error:
 
     nvenc_unload_nvenc(avctx);
 
-    return res;
+    return ret;
 }
 
 av_cold int ff_nvenc_encode_close(AVCodecContext *avctx)
