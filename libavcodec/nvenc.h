@@ -137,10 +137,7 @@ typedef struct NVENCContext
     int nb_surfaces;
     NVENCFrame *frames;
     AVFifoBuffer *timestamps;
-
-    AVFifoBuffer *pending;
-    AVFifoBuffer *ready;
-    int64_t last_dts;
+    AVFifoBuffer *pending, *ready;
 
     struct {
         CUdeviceptr ptr;
@@ -153,6 +150,8 @@ typedef struct NVENCContext
      * AVCodecContext.pix_fmt when using hwaccel frames on input */
     enum AVPixelFormat data_pix_fmt;
 
+    int64_t last_dts;
+
     void *nvenc_ctx;
 
     int preset;
@@ -162,7 +161,7 @@ typedef struct NVENCContext
     int rc;
     int device;
     int flags;
-    int buffer_delay;
+    int async_depth;
 } NVENCContext;
 
 int ff_nvenc_encode_init(AVCodecContext *avctx);
