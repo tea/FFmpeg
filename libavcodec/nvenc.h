@@ -61,6 +61,10 @@ typedef struct NvencSurface
     NV_ENC_BUFFER_FORMAT format;
     int size;
     int lockCount;
+
+    int64_t pts;
+    uint8_t* sei_data;
+    size_t sei_size;
 } NvencSurface;
 
 typedef CUresult(CUDAAPI *PCUINIT)(unsigned int Flags);
@@ -174,6 +178,7 @@ typedef struct NvencContext
     int device;
     int flags;
     int async_depth;
+    int a53_cc;
 } NvencContext;
 
 int ff_nvenc_encode_init(AVCodecContext *avctx);

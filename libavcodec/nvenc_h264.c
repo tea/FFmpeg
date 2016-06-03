@@ -83,6 +83,7 @@ static const AVOption options[] = {
     { "any",      "Pick the first device available",      0,                   AV_OPT_TYPE_CONST,  { .i64 = ANY_DEVICE },           0, 0, VE, "gpu" },
     { "list",     "List the available devices",           0,                   AV_OPT_TYPE_CONST,  { .i64 = LIST_DEVICES },         0, 0, VE, "gpu" },
     { "delay",    "Delay frame output by the given amount of frames", OFFSET(async_depth), AV_OPT_TYPE_INT, { .i64 = INT_MAX }, 0, INT_MAX, VE },
+    { "a53cc",    "Use A53 Closed Captions (if available)", OFFSET(a53_cc),    AV_OPT_TYPE_BOOL,   { .i64 = 1 },                    0, 1, VE},
     { NULL }
 };
 

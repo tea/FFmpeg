@@ -1115,6 +1115,7 @@ av_cold int ff_nvenc_encode_close(AVCodecContext *avctx)
                 p_nvenc->nvEncDestroyInputBuffer(ctx->nvencoder, ctx->surfaces[i].input_surface);
             av_frame_free(&ctx->surfaces[i].in_ref);
             p_nvenc->nvEncDestroyBitstreamBuffer(ctx->nvencoder, ctx->surfaces[i].output_surface);
+            av_freep(&ctx->surfaces[i].sei_data);
         }
     }
     av_freep(&ctx->surfaces);
@@ -1451,6 +1452,47 @@ static int nvenc_set_timestamp(AVCodecContext *avctx,
     return 0;
 }
 
+static void embed_sei(uint8_t* output, const uint8_t* bitstream, size_t bitstream_size, const uint8_t* sei, size_t sei_size)
+{
+    int nal_seq = 0;
+    uint8_t type;
+    // copy NAL at the time
+    while(bitstream_size > 0)
+    {
+        uint8_t b = (*output++ = *bitstream++);
+        bitstream_size--;
+        if (nal_seq < 2)
+        {
+            nal_seq = b == 0 ? nal_seq+1 : 0;
+        } else
+        {
+            nal_seq = b == 0 ? 2 : b == 1 ? 3 : 0;
+        }
+        if (nal_seq != 3 || bitstream_size == 0)
+            continue;
+        // NAL detected
+        type = *bitstream & 0x1F;
+        if (type == 7 || type == 8 || type == 9 || type == 6)
+        {
+            nal_seq = 0;
+            continue; // skip AUD/SPS/PPS and other SEI
+        }
+        // insert SEI
+        *output++ = 6;
+        *output++ = 4; // payload type
+        *output++ = (uint8_t)sei_size;
+        memcpy(output, sei, sei_size);
+        output += sei_size;
+        *output++ = 0x80;
+        *output++ = 0;
+        *output++ = 0; // next NAL
+        *output++ = 0;
+        *output++ = 1;
+        memcpy(output, bitstream, bitstream_size);
+        return;
+    }
+}
+
 static int process_output_surface(AVCodecContext *avctx, AVPacket *pkt, NvencSurface *tmpoutsurf)
 {
     NvencContext *ctx = avctx->priv_data;
@@ -1462,6 +1504,8 @@ static int process_output_surface(AVCodecContext *avctx, AVPacket *pkt, NvencSur
     NV_ENC_LOCK_BITSTREAM lock_params = { 0 };
     NVENCSTATUS nv_status;
     int res = 0;
+    NvencSurface *sei_surface = NULL;
+    int i;
 
     enum AVPictureType pict_type;
 
@@ -1494,12 +1538,30 @@ static int process_output_surface(AVCodecContext *avctx, AVPacket *pkt, NvencSur
         goto error;
     }
 
-    if (res = ff_alloc_packet2(avctx, pkt, lock_params.bitstreamSizeInBytes,0)) {
+    for(i = 0; i < ctx->nb_surfaces; ++i) {
+        if (ctx->surfaces[i].pts == lock_params.outputTimeStamp && ctx->surfaces[i].sei_data)
+        {
+            sei_surface = &ctx->surfaces[i];
+            break;
+        }
+    }
+
+    if (res = ff_alloc_packet2(avctx, pkt, lock_params.bitstreamSizeInBytes + (sei_surface ? 8+sei_surface->sei_size : 0), 0)) {
         p_nvenc->nvEncUnlockBitstream(ctx->nvencoder, tmpoutsurf->output_surface);
         goto error;
     }
 
-    memcpy(pkt->data, lock_params.bitstreamBufferPtr, lock_params.bitstreamSizeInBytes);
+    if (sei_surface)
+    {
+        embed_sei(pkt->data, lock_params.bitstreamBufferPtr, lock_params.bitstreamSizeInBytes, sei_surface ? sei_surface->sei_data : 0, sei_surface ? sei_surface->sei_size : 0);
+        av_freep(&sei_surface->sei_data);
+        sei_surface->sei_size = 0;
+    }
+    else
+    {
+        memcpy(pkt->data, lock_params.bitstreamBufferPtr, lock_params.bitstreamSizeInBytes);
+    }
+
 
     nv_status = p_nvenc->nvEncUnlockBitstream(ctx->nvencoder, tmpoutsurf->output_surface);
     if (nv_status != NV_ENC_SUCCESS)
@@ -1624,6 +1686,28 @@ int ff_nvenc_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
 
         pic_params.encodePicFlags = 0;
         pic_params.inputTimeStamp = frame->pts;
+
+        if (ctx->a53_cc) {
+            uint8_t* sei_data;
+            size_t sei_size;
+            if (ff_alloc_a53_sei(frame, 0, (void**)&sei_data, &sei_size) < 0) {
+                    av_log(ctx, AV_LOG_ERROR, "Not enough memory for closed captions, skipping\n");
+            }
+            if (sei_data) {
+                unsigned int i;
+                for(i = 0; i < ctx->nb_surfaces; ++i)
+                {
+                    if (!ctx->surfaces[i].sei_data) {
+                        ctx->surfaces[i].sei_data = sei_data;
+                        ctx->surfaces[i].sei_size = sei_size;
+                        ctx->surfaces[i].pts = frame->pts;
+                        sei_data = NULL;
+                        break;
+                    }
+                }
+            }
+            av_assert0(sei_data == NULL);
+        }
 
         nvenc_codec_specific_pic_params(avctx, &pic_params);
     } else {
