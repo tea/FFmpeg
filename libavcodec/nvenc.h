@@ -155,6 +155,7 @@ typedef struct NvencContext
     int quality;
     int aud;
     int bluray_compat;
+    int a53_cc;
 } NvencContext;
 
 int ff_nvenc_encode_init(AVCodecContext *avctx);

@@ -109,6 +109,7 @@ static const AVOption options[] = {
                                                             OFFSET(quality),      AV_OPT_TYPE_INT,   { .i64 = 0 }, 0, 51, VE },
     { "aud",          "Use access unit delimiters",         OFFSET(aud),          AV_OPT_TYPE_BOOL,  { .i64 = 0 }, 0, 1, VE },
     { "bluray-compat", "Bluray compatibility workarounds",  OFFSET(bluray_compat),AV_OPT_TYPE_BOOL,  { .i64 = 0 }, 0, 1, VE },
+    { "a53cc",        "Use A53 Closed Captions (if available)", OFFSET(a53_cc),   AV_OPT_TYPE_BOOL,  { .i64 = 1 }, 0, 1, VE },
     { NULL }
 };
 
