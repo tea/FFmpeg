@@ -138,6 +138,8 @@ void avfilter_register_all(void)
 
     REGISTER_FILTER(ANULLSINK,      anullsink,      asink);
 
+    REGISTER_FILTER(A53_COMBINE,    a53_combine,    vf);
+    REGISTER_FILTER(A53_SPLIT,      a53_split,      vf);
     REGISTER_FILTER(ALPHAEXTRACT,   alphaextract,   vf);
     REGISTER_FILTER(ALPHAMERGE,     alphamerge,     vf);
     REGISTER_FILTER(ASS,            ass,            vf);
