@@ -331,6 +331,21 @@ sigterm_handler(int sig)
     }
 }
 
+static void switch_debug_ts(int sig)
+{
+    int i;
+    av_log(NULL, AV_LOG_INFO, "Switching debug_ts flag\n");
+    debug_ts = !debug_ts;
+    for(i = 0; i < nb_input_files; ++i)
+    {
+        if (debug_ts)
+            input_files[i]->ctx->debug |= FF_FDEBUG_TS;
+        else
+            input_files[i]->ctx->debug &= ~FF_FDEBUG_TS;
+    }
+    av_log_set_level(debug_ts ? AV_LOG_TRACE : AV_LOG_VERBOSE);
+}
+
 #if HAVE_SETCONSOLECTRLHANDLER
 static BOOL WINAPI CtrlHandler(DWORD fdwCtrlType)
 {
@@ -386,6 +401,11 @@ void term_init(void)
         signal(SIGQUIT, sigterm_handler); /* Quit (POSIX).  */
     }
 #endif
+
+    {
+        struct sigaction act = {&switch_debug_ts, NULL, 0, 0, NULL};
+        sigaction(SIGUSR1, &act, NULL);
+    }
 
     signal(SIGINT , sigterm_handler); /* Interrupt (ANSI).    */
     signal(SIGTERM, sigterm_handler); /* Termination (ANSI).  */

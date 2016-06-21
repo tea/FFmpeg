@@ -2735,6 +2735,10 @@ static int mpegts_read_packet(AVFormatContext *s, AVPacket *pkt)
 
     if (!ret && pkt->size < 0)
         ret = AVERROR_INVALIDDATA;
+    if (pkt->size > 0 && s->debug & FF_FDEBUG_TS)
+	av_log(s, AV_LOG_TRACE, "%d: pts=%"PRId64", pts=%0.3f, dts=%"PRId64", dts=%0.3f size=%d\n",
+		    pkt->stream_index, pkt->pts, pkt->pts / 90000.0, pkt->dts, pkt->dts / 90000.0,
+		    pkt->size);
     return ret;
 }
 
