@@ -240,6 +240,10 @@ typedef struct PESContext {
     int extended_stream_id;
     uint8_t stream_id;
     int64_t pts, dts;
+    /* for makings pts/dts consistent on long-running feeds */
+    int64_t last_dts;
+    unsigned int dts_wraps;
+
     int64_t ts_packet_pos; /**< position of first TS packet of this PES packet */
     uint8_t header[MAX_PES_HEADER_SIZE];
     AVBufferRef *buffer;
@@ -342,6 +346,39 @@ static void set_pcr_pid(AVFormatContext *s, unsigned int programid, unsigned int
             break;
         }
     }
+}
+
+static void fix_pts_dts(PESContext *pes) {
+    int64_t currdts;
+
+    if (pes->last_dts == AV_NOPTS_VALUE) {
+        pes->last_dts = pes->dts;
+        return;
+    }
+    if (pes->dts == AV_NOPTS_VALUE) {
+        return;
+    }
+
+    // calculate the value we use for measurements against the last good value
+    currdts = pes->dts + (1ULL << 33) * pes->dts_wraps;
+
+    if (currdts < pes->last_dts) {
+        /* While wrapping backwards should never happen unless we overflow, bad
+         * input does happen. Only wrap if wrapped timestamp is not far from actual.
+         */
+        if (((1ULL << 33) + currdts - pes->last_dts) < 900000ULL) {
+            currdts += 1ULL << 33;
+            pes->dts_wraps++;
+            av_log(pes->ts->stream, AV_LOG_INFO, "Stream %d timestamps wrapping\n", pes->st->index);
+        }
+    }
+
+    pes->last_dts = pes->dts = currdts;
+
+    // Now fix the pts in the much the same way. It is always true that dts <= pts
+    pes->pts += (1ULL << 33) * pes->dts_wraps;
+    while (pes->pts < pes->dts)
+        pes->pts += 1ULL << 33;
 }
 
 /**
@@ -802,7 +839,7 @@ static int mpegts_set_stream_info(AVStream *st, PESContext *pes,
         return 0;
     }
 
-    avpriv_set_pts_info(st, 33, 1, 90000);
+    avpriv_set_pts_info(st, 64, 1, 90000);
     st->priv_data         = pes;
     st->codecpar->codec_type = AVMEDIA_TYPE_DATA;
     st->codecpar->codec_id   = AV_CODEC_ID_NONE;
@@ -840,7 +877,7 @@ static int mpegts_set_stream_info(AVStream *st, PESContext *pes,
             }
 
             sub_st->id = pes->pid;
-            avpriv_set_pts_info(sub_st, 33, 1, 90000);
+            avpriv_set_pts_info(sub_st, 64, 1, 90000);
             sub_st->priv_data         = sub_pes;
             sub_st->codecpar->codec_type = AVMEDIA_TYPE_AUDIO;
             sub_st->codecpar->codec_id   = AV_CODEC_ID_AC3;
@@ -1153,6 +1190,7 @@ skip:
                     pes->dts = ff_parse_pes_pts(r);
                     r += 5;
                 }
+                fix_pts_dts(pes);
                 pes->extended_stream_id = -1;
                 if (flags & 0x01) { /* PES extension */
                     pes_ext = *r++;
@@ -1285,14 +1323,16 @@ static PESContext *add_pes_stream(MpegTSContext *ts, int pid, int pcr_pid)
     pes = av_mallocz(sizeof(PESContext));
     if (!pes)
         return 0;
-    pes->ts      = ts;
-    pes->stream  = ts->stream;
-    pes->pid     = pid;
-    pes->pcr_pid = pcr_pid;
-    pes->state   = MPEGTS_SKIP;
-    pes->pts     = AV_NOPTS_VALUE;
-    pes->dts     = AV_NOPTS_VALUE;
-    tss          = mpegts_open_pes_filter(ts, pid, mpegts_push_data, pes);
+    pes->ts        = ts;
+    pes->stream    = ts->stream;
+    pes->pid       = pid;
+    pes->pcr_pid   = pcr_pid;
+    pes->state     = MPEGTS_SKIP;
+    pes->pts       = AV_NOPTS_VALUE;
+    pes->dts       = AV_NOPTS_VALUE;
+    pes->last_dts  = AV_NOPTS_VALUE;
+    pes->dts_wraps = 0;
+    tss            = mpegts_open_pes_filter(ts, pid, mpegts_push_data, pes);
     if (!tss) {
         av_free(pes);
         return 0;
