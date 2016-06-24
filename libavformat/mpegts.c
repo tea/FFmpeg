@@ -352,22 +352,22 @@ static void fix_pts_dts(PESContext *pes) {
         pes->last_dts = pes->dts;
         return;
     }
+    if (pes->dts == AV_NOPTS_VALUE) {
+        return;
+    }
 
     // calculate the value we use for measurements against the last good value
     currdts = pes->dts + (1ULL << 33) * pes->dts_wraps;
 
     if (currdts < pes->last_dts) {
         /* While wrapping backwards should never happen unless we overflow, bad
-         * input does happen. Don't wrap if the reverse in timestamps is small.
-         * I have selected 90000 (1 second) semi-arbitrarily.
+         * input does happen. Only wrap if wrapped timestamp is not far from actual.
          */
-        if ((pes->last_dts - currdts) < 90000) {
-            pes->last_dts = currdts;
-            return;
+        if (((1ULL << 33) + currdts - pes->last_dts) < 900000ULL) {
+            currdts += 1ULL << 33;
+            pes->dts_wraps++;
+            av_log(pes->ts->stream, AV_LOG_INFO, "Stream %d timestamps wrapping\n", pes->st->index);
         }
-        currdts += 1ULL << 33;
-        pes->dts_wraps++;
-        av_log(pes->ts->stream, AV_LOG_INFO, "Stream timestamps wrapping\n");
     }
 
     pes->last_dts = pes->dts = currdts;
@@ -830,7 +830,7 @@ static int mpegts_set_stream_info(AVStream *st, PESContext *pes,
         return 0;
     }
 
-    avpriv_set_pts_info(st, 33, 1, 90000);
+    avpriv_set_pts_info(st, 64, 1, 90000);
     st->priv_data         = pes;
     st->codecpar->codec_type = AVMEDIA_TYPE_DATA;
     st->codecpar->codec_id   = AV_CODEC_ID_NONE;
@@ -868,7 +868,7 @@ static int mpegts_set_stream_info(AVStream *st, PESContext *pes,
             }
 
             sub_st->id = pes->pid;
-            avpriv_set_pts_info(sub_st, 33, 1, 90000);
+            avpriv_set_pts_info(sub_st, 64, 1, 90000);
             sub_st->priv_data         = sub_pes;
             sub_st->codecpar->codec_type = AVMEDIA_TYPE_AUDIO;
             sub_st->codecpar->codec_id   = AV_CODEC_ID_AC3;
