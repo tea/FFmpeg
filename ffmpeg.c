@@ -4172,6 +4172,18 @@ static int process_input(int file_index)
     pkt_dts = av_rescale_q_rnd(pkt.dts, ist->st->time_base, AV_TIME_BASE_Q, AV_ROUND_NEAR_INF|AV_ROUND_PASS_MINMAX);
     if ((ist->dec_ctx->codec_type == AVMEDIA_TYPE_VIDEO ||
          ist->dec_ctx->codec_type == AVMEDIA_TYPE_AUDIO) &&
+        pkt_dts != AV_NOPTS_VALUE && ist->next_dts == AV_NOPTS_VALUE &&
+        (is->iformat->flags & AVFMT_TS_DISCONT) && ifile->last_ts != AV_NOPTS_VALUE) {
+        int64_t delta   = pkt_dts - ifile->last_ts;
+        if (delta < -1LL*dts_delta_threshold*AV_TIME_BASE ||
+            delta >  1LL*dts_delta_threshold*AV_TIME_BASE){
+            av_log(NULL, AV_LOG_ERROR,
+                   "Inter stream timestamp discontinuity %"PRId64", last_ts=%"PRId64", pkt_dts=%"PRId64"\n",
+                   delta, ifile->last_ts, pkt_dts);
+        }
+    }
+    if ((ist->dec_ctx->codec_type == AVMEDIA_TYPE_VIDEO ||
+         ist->dec_ctx->codec_type == AVMEDIA_TYPE_AUDIO) &&
         pkt_dts != AV_NOPTS_VALUE && ist->next_dts == AV_NOPTS_VALUE && !copy_ts
         && (is->iformat->flags & AVFMT_TS_DISCONT) && ifile->last_ts != AV_NOPTS_VALUE) {
         int64_t delta   = pkt_dts - ifile->last_ts;
@@ -4198,6 +4210,20 @@ static int process_input(int file_index)
         pkt.dts += duration;
 
     pkt_dts = av_rescale_q_rnd(pkt.dts, ist->st->time_base, AV_TIME_BASE_Q, AV_ROUND_NEAR_INF|AV_ROUND_PASS_MINMAX);
+    if ((ist->dec_ctx->codec_type == AVMEDIA_TYPE_VIDEO ||
+         ist->dec_ctx->codec_type == AVMEDIA_TYPE_AUDIO) &&
+         pkt_dts != AV_NOPTS_VALUE && ist->next_dts != AV_NOPTS_VALUE) {
+        int64_t delta   = pkt_dts - ist->next_dts;
+        if (is->iformat->flags & AVFMT_TS_DISCONT) {
+            if (delta < -1LL*dts_delta_threshold*AV_TIME_BASE ||
+                delta >  1LL*dts_delta_threshold*AV_TIME_BASE ||
+                pkt_dts + AV_TIME_BASE/10 < FFMAX(ist->pts, ist->dts)) {
+                av_log(NULL, AV_LOG_ERROR,
+                       "timestamp discontinuity %"PRId64", pts=%"PRId64", dts=%"PRId64", pkt_dts=%"PRId64", next_dts=%"PRId64"\n",
+		       delta, ist->pts, ist->dts, pkt_dts, ist->next_dts);
+            }
+        }
+    }
     if ((ist->dec_ctx->codec_type == AVMEDIA_TYPE_VIDEO ||
          ist->dec_ctx->codec_type == AVMEDIA_TYPE_AUDIO) &&
          pkt_dts != AV_NOPTS_VALUE && ist->next_dts != AV_NOPTS_VALUE &&
