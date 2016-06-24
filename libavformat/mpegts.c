@@ -237,6 +237,10 @@ typedef struct PESContext {
     int extended_stream_id;
     uint8_t stream_id;
     int64_t pts, dts;
+    /* for makings pts/dts consistent on long-running feeds */
+    int64_t last_dts;
+    unsigned int dts_wraps;
+
     int64_t ts_packet_pos; /**< position of first TS packet of this PES packet */
     uint8_t header[MAX_PES_HEADER_SIZE];
     AVBufferRef *buffer;
@@ -339,6 +343,39 @@ static void set_pcr_pid(AVFormatContext *s, unsigned int programid, unsigned int
             break;
         }
     }
+}
+
+static void fix_pts_dts(PESContext *pes) {
+    int64_t currdts;
+
+    if (pes->last_dts == AV_NOPTS_VALUE) {
+        pes->last_dts = pes->dts;
+        return;
+    }
+
+    // calculate the value we use for measurements against the last good value
+    currdts = pes->dts + (1ULL << 33) * pes->dts_wraps;
+
+    if (currdts < pes->last_dts) {
+        /* While wrapping backwards should never happen unless we overflow, bad
+         * input does happen. Don't wrap if the reverse in timestamps is small.
+         * I have selected 90000 (1 second) semi-arbitrarily.
+         */
+        if ((pes->last_dts - currdts) < 90000) {
+            pes->last_dts = currdts;
+            return;
+        }
+        currdts += 1ULL << 33;
+        pes->dts_wraps++;
+        av_log(pes->ts->stream, AV_LOG_INFO, "Stream timestamps wrapping\n");
+    }
+
+    pes->last_dts = pes->dts = currdts;
+
+    // Now fix the pts in the much the same way. It is always true that dts <= pts
+    pes->pts += (1ULL << 33) * pes->dts_wraps;
+    while (pes->pts < pes->dts)
+        pes->pts += 1ULL << 33;
 }
 
 /**
@@ -1137,6 +1174,7 @@ skip:
                     pes->dts = ff_parse_pes_pts(r);
                     r += 5;
                 }
+                fix_pts_dts(pes);
                 pes->extended_stream_id = -1;
                 if (flags & 0x01) { /* PES extension */
                     pes_ext = *r++;
@@ -1269,14 +1307,16 @@ static PESContext *add_pes_stream(MpegTSContext *ts, int pid, int pcr_pid)
     pes = av_mallocz(sizeof(PESContext));
     if (!pes)
         return 0;
-    pes->ts      = ts;
-    pes->stream  = ts->stream;
-    pes->pid     = pid;
-    pes->pcr_pid = pcr_pid;
-    pes->state   = MPEGTS_SKIP;
-    pes->pts     = AV_NOPTS_VALUE;
-    pes->dts     = AV_NOPTS_VALUE;
-    tss          = mpegts_open_pes_filter(ts, pid, mpegts_push_data, pes);
+    pes->ts        = ts;
+    pes->stream    = ts->stream;
+    pes->pid       = pid;
+    pes->pcr_pid   = pcr_pid;
+    pes->state     = MPEGTS_SKIP;
+    pes->pts       = AV_NOPTS_VALUE;
+    pes->dts       = AV_NOPTS_VALUE;
+    pes->last_dts  = AV_NOPTS_VALUE;
+    pes->dts_wraps = 0;
+    tss            = mpegts_open_pes_filter(ts, pid, mpegts_push_data, pes);
     if (!tss) {
         av_free(pes);
         return 0;
