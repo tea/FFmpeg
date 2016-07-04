@@ -333,6 +333,7 @@ static int open_file(AVFormatContext *avf, unsigned fileno)
         avformat_close_input(&cat->avf);
         return ret;
     }
+    av_log(avf, AV_LOG_DEBUG, "Opened new file '%s'\n", file->url);
     cat->cur_file = file;
     if (file->start_time == AV_NOPTS_VALUE)
         file->start_time = !fileno ? 0 :
@@ -510,6 +511,8 @@ static int open_next_file(AVFormatContext *avf)
 
     if (cat->cur_file->duration == AV_NOPTS_VALUE)
         cat->cur_file->duration = cat->avf->duration - (cat->cur_file->file_inpoint - cat->cur_file->file_start_time);
+    AVRational timebase = AV_TIME_BASE_Q;
+    av_log(avf, AV_LOG_VERBOSE, "Setting duration to %s (%s)\n", av_ts2str(cat->cur_file->duration), av_ts2timestr(cat->cur_file->duration, &timebase));
 
     if (++fileno >= cat->nb_files) {
         cat->eof = 1;
