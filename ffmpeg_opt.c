@@ -3294,11 +3294,11 @@ int ffmpeg_parse_options(int argc, char **argv)
     }
 
     /* configure the complex filtergraphs */
-    ret = configure_complex_filters();
-    if (ret < 0) {
-        av_log(NULL, AV_LOG_FATAL, "Error configuring complex filters.\n");
-        goto fail;
-    }
+//    ret = configure_complex_filters();
+//    if (ret < 0) {
+//        av_log(NULL, AV_LOG_FATAL, "Error configuring complex filters.\n");
+//        goto fail;
+//    }
 
 fail:
     uninit_parse_context(&octx);

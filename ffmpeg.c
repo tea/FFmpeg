@@ -3114,8 +3114,7 @@ static int init_output_stream_encode(OutputStream *ost)
     }
 
     if ((enc_ctx->codec_type == AVMEDIA_TYPE_VIDEO ||
-         enc_ctx->codec_type == AVMEDIA_TYPE_AUDIO) &&
-         filtergraph_is_simple(ost->filter->graph)) {
+         enc_ctx->codec_type == AVMEDIA_TYPE_AUDIO)) {
             FilterGraph *fg = ost->filter->graph;
 
             if (configure_filtergraph(fg)) {
@@ -3483,7 +3482,7 @@ static int transcode_init(void)
             goto dump_format;
         }
 
-    /* open each encoder */
+	/* open each encoder */
     for (i = 0; i < nb_output_streams; i++) {
         ret = init_output_stream(output_streams[i], error, sizeof(error));
         if (ret < 0)
