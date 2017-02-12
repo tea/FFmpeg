@@ -33,6 +33,9 @@
 #include "avcodec.h"
 #include "internal.h"
 
+#define MAX_FRAME_COUNT 25
+#define A53_QUEUE_SIZE (MAX_FRAME_COUNT + 8)
+
 typedef struct CuvidContext
 {
     AVClass *avclass;
@@ -59,6 +62,11 @@ typedef struct CuvidContext
     cudaVideoCodec codec_type;
     cudaVideoChromaFormat chroma_format;
 
+    uint8_t* a53_caption;
+    int a53_caption_size;
+    uint8_t* a53_caption_queue[A53_QUEUE_SIZE];
+    int a53_caption_size_queue[A53_QUEUE_SIZE];
+
     CUVIDPARSERPARAMS cuparseinfo;
     CUVIDEOFORMATEX cuparse_ext;
 
@@ -71,6 +79,8 @@ typedef struct CuvidParsedFrame
     CUVIDPARSERDISPINFO dispinfo;
     int second_field;
     int is_deinterlacing;
+    uint8_t* a53_caption;
+    int a53_caption_size;
 } CuvidParsedFrame;
 
 static int check_cu(AVCodecContext *avctx, CUresult err, const char *func)
@@ -277,6 +287,24 @@ static int CUDAAPI cuvid_handle_picture_decode(void *opaque, CUVIDPICPARAMS* pic
 
     av_log(avctx, AV_LOG_TRACE, "pfnDecodePicture\n");
 
+    if (ctx->a53_caption)
+    {
+
+        if (picparams->CurrPicIdx >= A53_QUEUE_SIZE)
+        {
+            av_log(avctx, AV_LOG_WARNING, "CurrPicIdx too big: %d\n", picparams->CurrPicIdx);
+            av_freep(&ctx->a53_caption);
+        }
+        else
+        {
+            int pos = picparams->CurrPicIdx;
+            av_freep(&ctx->a53_caption_queue[pos]);
+            ctx->a53_caption_queue[pos] = ctx->a53_caption;
+            ctx->a53_caption_size_queue[pos] = ctx->a53_caption_size;
+            ctx->a53_caption = NULL;
+        }
+    }
+
     ctx->internal_error = CHECK_CU(ctx->cvdl->cuvidDecodePicture(ctx->cudecoder, picparams));
     if (ctx->internal_error < 0)
         return 0;
@@ -289,21 +317,171 @@ static int CUDAAPI cuvid_handle_picture_display(void *opaque, CUVIDPARSERDISPINF
     AVCodecContext *avctx = opaque;
     CuvidContext *ctx = avctx->priv_data;
     CuvidParsedFrame parsed_frame = { { 0 } };
+    uint8_t* a53_caption = NULL;
+    int a53_caption_size = 0;
+
+    if (dispinfo->picture_index >= A53_QUEUE_SIZE)
+    {
+        av_log(avctx, AV_LOG_WARNING, "picture_index too big: %d\n", dispinfo->picture_index);
+    }
+    else
+    {
+        int pos = dispinfo->picture_index;
+        a53_caption = ctx->a53_caption_queue[pos];
+        a53_caption_size = ctx->a53_caption_size_queue[pos];
+        ctx->a53_caption_queue[pos] = NULL;
+    }
 
     parsed_frame.dispinfo = *dispinfo;
     ctx->internal_error = 0;
 
     if (ctx->deint_mode == cudaVideoDeinterlaceMode_Weave) {
+        parsed_frame.a53_caption = a53_caption;
+        parsed_frame.a53_caption_size = a53_caption_size;
         av_fifo_generic_write(ctx->frame_queue, &parsed_frame, sizeof(CuvidParsedFrame), NULL);
     } else {
         parsed_frame.is_deinterlacing = 1;
         av_fifo_generic_write(ctx->frame_queue, &parsed_frame, sizeof(CuvidParsedFrame), NULL);
         parsed_frame.second_field = 1;
+        parsed_frame.a53_caption = a53_caption;
+        parsed_frame.a53_caption_size = a53_caption_size;
         av_fifo_generic_write(ctx->frame_queue, &parsed_frame, sizeof(CuvidParsedFrame), NULL);
     }
 
     return 1;
 }
+
+static void cuvid_mpeg_parse_a53(CuvidContext *ctx, const uint8_t* p, int buf_size)
+{
+    const uint8_t* buf_end = p + buf_size;
+    for(;;)
+    {
+        uint32_t start_code = -1;
+        p = avpriv_find_start_code(p, buf_end, &start_code);
+        if (start_code > 0x1ff)
+            break;
+        if (start_code != 0x1b2)
+            continue;
+        buf_size = buf_end - p;
+        if (buf_size >= 6 &&
+            p[0] == 'G' && p[1] == 'A' && p[2] == '9' && p[3] == '4' && p[4] == 3 && (p[5] & 0x40))
+        {
+            /* extract A53 Part 4 CC data */
+            int cc_count = p[5] & 0x1f;
+            if (cc_count > 0 && buf_size >= 7 + cc_count * 3)
+            {
+                av_freep(&ctx->a53_caption);
+                ctx->a53_caption_size = cc_count * 3;
+                ctx->a53_caption      = av_malloc(ctx->a53_caption_size);
+                if (ctx->a53_caption)
+                    memcpy(ctx->a53_caption, p + 7, ctx->a53_caption_size);
+            }
+        }
+        else if (buf_size >= 11 && p[0] == 'C' && p[1] == 'C' && p[2] == 0x01 && p[3] == 0xf8)
+        {
+            int cc_count = 0;
+            int i;
+            // There is a caption count field in the data, but it is often
+            // incorrect.  So count the number of captions present.
+            for (i = 5; i + 6 <= buf_size && ((p[i] & 0xfe) == 0xfe); i += 6)
+                cc_count++;
+            // Transform the DVD format into A53 Part 4 format
+            if (cc_count > 0) {
+                av_freep(&ctx->a53_caption);
+                ctx->a53_caption_size = cc_count * 6;
+                ctx->a53_caption      = av_malloc(ctx->a53_caption_size);
+                if (ctx->a53_caption) {
+                    uint8_t field1 = !!(p[4] & 0x80);
+                    uint8_t *cap = ctx->a53_caption;
+                    p += 5;
+                    for (i = 0; i < cc_count; i++)
+                    {
+                        cap[0] = (p[0] == 0xff && field1) ? 0xfc : 0xfd;
+                        cap[1] = p[1];
+                        cap[2] = p[2];
+                        cap[3] = (p[3] == 0xff && !field1) ? 0xfc : 0xfd;
+                        cap[4] = p[4];
+                        cap[5] = p[5];
+                        cap += 6;
+                        p += 6;
+                    }
+                }
+            }
+        }
+    }
+}
+
+
+static void cuvid_h264_parse_a53(CuvidContext *ctx, const uint8_t* p, int buf_size)
+{
+    const uint8_t* buf_end = p + buf_size;
+    while(p < buf_end)
+    {
+        int i;
+        uint32_t start_code = -1;
+        p = avpriv_find_start_code(p, buf_end, &start_code);
+            if (start_code > 0x1ff)
+            break;
+        if (start_code != 0x106)
+            continue;
+        buf_size = buf_end - p;
+        if (buf_size < 1 || p[0] != 4)
+            continue;
+        p += 1; buf_size -= 1;
+        int size = 0;
+        while (buf_size > 0)
+        {
+            size += p[0];
+            buf_size -= 1;
+            if (*(p++) != 0xFF)
+                break;
+        }
+        if (buf_size <= 0 || buf_size < size)
+            continue;
+        if (size < 7)
+            continue;
+        if (p[0] == 0xFF)
+        {
+            p+=4;
+            size-=4;
+        }
+        else
+        {
+            p+=3;
+            size-=3;
+        }
+        if (p[0] != 'G' || p[1] != 'A' || p[2] != '9' || p[3] != '4')
+            continue;
+        p += 4;
+        size -= 4;
+
+        if (size < 3)
+            continue;
+        if (p[0] != 3)
+            continue;
+        if (!(p[1] & 0x40))
+            continue;
+        int cc_count = p[1] & 0x1F;
+        p+=3;
+        size -= 3;
+
+        if (!cc_count || size < cc_count * 3)
+            continue;
+
+        if (!ctx->a53_caption)
+            ctx->a53_caption_size = 0;
+        const uint64_t new_size = (ctx->a53_caption_size + cc_count * 3);
+        if (av_reallocp(&ctx->a53_caption, new_size) < 0)
+            continue;
+        for(i = 0; i < cc_count; ++i, p += 3)
+        {
+            ctx->a53_caption[ctx->a53_caption_size++] = p[0];
+            ctx->a53_caption[ctx->a53_caption_size++] = p[1];
+            ctx->a53_caption[ctx->a53_caption_size++] = p[2];
+        }
+    }
+}
+
 
 static int cuvid_decode_packet(AVCodecContext *avctx, const AVPacket *avpkt)
 {
@@ -356,19 +534,29 @@ static int cuvid_decode_packet(AVCodecContext *avctx, const AVPacket *avpkt)
         cupkt.payload_size = avpkt->size;
         cupkt.payload = avpkt->data;
 
-        if (avpkt->pts != AV_NOPTS_VALUE) {
+        if (avpkt->pts != AV_NOPTS_VALUE)
+        {
             cupkt.flags = CUVID_PKT_TIMESTAMP;
             if (avctx->pkt_timebase.num && avctx->pkt_timebase.den)
                 cupkt.timestamp = av_rescale_q(avpkt->pts, avctx->pkt_timebase, (AVRational){1, 10000000});
             else
                 cupkt.timestamp = avpkt->pts;
-        }
+       }
     } else {
         cupkt.flags = CUVID_PKT_ENDOFSTREAM;
         ctx->decoder_flushing = 1;
     }
 
     ret = CHECK_CU(ctx->cvdl->cuvidParseVideoData(ctx->cuparser, &cupkt));
+
+    // assume there is one frame delay (the parser outputs previous picture once it sees new frame data)
+    av_freep(&ctx->a53_caption);
+    if (avpkt && avpkt->size) {
+        if (ctx->cuparseinfo.CodecType == cudaVideoCodec_MPEG2)
+            cuvid_mpeg_parse_a53(ctx, avpkt->data, avpkt->size);
+        else if (ctx->cuparseinfo.CodecType == cudaVideoCodec_H264)
+            cuvid_h264_parse_a53(ctx, avpkt->data, avpkt->size);
+    }
 
     av_packet_unref(&filtered_packet);
 
@@ -538,6 +726,15 @@ FF_ENABLE_DEPRECATION_WARNINGS
 
         if (frame->interlaced_frame)
             frame->top_field_first = parsed_frame.dispinfo.top_field_first;
+
+        if (parsed_frame.a53_caption)
+        {
+            AVFrameSideData *sd = av_frame_new_side_data(frame, AV_FRAME_DATA_A53_CC, parsed_frame.a53_caption_size);
+            if (sd)
+                memcpy(sd->data, parsed_frame.a53_caption, parsed_frame.a53_caption_size);
+            av_freep(&parsed_frame.a53_caption);
+            avctx->properties |= FF_CODEC_PROPERTY_CLOSED_CAPTIONS;
+        }
     } else if (ctx->decoder_flushing) {
         ret = AVERROR_EOF;
     } else {
