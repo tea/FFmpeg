@@ -45,6 +45,7 @@ typedef struct CuvidContext
 
     char *cu_gpu;
     int nb_surfaces;
+    int drop_second_field;
 
     AVBufferRef *hwdevice;
     AVBufferRef *hwframe;
@@ -258,7 +259,7 @@ static int CUDAAPI cuvid_handle_video_sequence(void *opaque, CUVIDEOFORMAT* form
     cuinfo.bitDepthMinus8 = format->bit_depth_luma_minus8;
     cuinfo.DeinterlaceMode = ctx->deint_mode_current;
 
-    if (ctx->deint_mode_current != cudaVideoDeinterlaceMode_Weave)
+    if (ctx->deint_mode_current != cudaVideoDeinterlaceMode_Weave && !ctx->drop_second_field)
         avctx->framerate = av_mul_q(avctx->framerate, (AVRational){2, 1});
 
     ctx->internal_error = CHECK_CU(ctx->cvdl->cuvidCreateDecoder(&ctx->cudecoder, &cuinfo));
@@ -341,11 +342,15 @@ static int CUDAAPI cuvid_handle_picture_display(void *opaque, CUVIDPARSERDISPINF
         av_fifo_generic_write(ctx->frame_queue, &parsed_frame, sizeof(CuvidParsedFrame), NULL);
     } else {
         parsed_frame.is_deinterlacing = 1;
-        av_fifo_generic_write(ctx->frame_queue, &parsed_frame, sizeof(CuvidParsedFrame), NULL);
-        parsed_frame.second_field = 1;
         parsed_frame.a53_caption = a53_caption;
         parsed_frame.a53_caption_size = a53_caption_size;
         av_fifo_generic_write(ctx->frame_queue, &parsed_frame, sizeof(CuvidParsedFrame), NULL);
+	if (!ctx->drop_second_field) {
+		parsed_frame.a53_caption = NULL;
+		parsed_frame.a53_caption_size = 0;
+		parsed_frame.second_field = 1;
+		av_fifo_generic_write(ctx->frame_queue, &parsed_frame, sizeof(CuvidParsedFrame), NULL);
+	}
     }
 
     return 1;
@@ -1127,6 +1132,7 @@ static const AVOption options[] = {
     { "adaptive", "Adaptive deinterlacing",                  0, AV_OPT_TYPE_CONST, { .i64 = cudaVideoDeinterlaceMode_Adaptive }, 0, 0, VD, "deint" },
     { "gpu",      "GPU to be used for decoding", OFFSET(cu_gpu), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, VD },
     { "surfaces", "Maximum surfaces to be used for decoding", OFFSET(nb_surfaces), AV_OPT_TYPE_INT, { .i64 = 25 }, 0, INT_MAX, VD },
+    { "drop_second_field", "Drop second field when deinterlacing", OFFSET(drop_second_field), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, VD },
     { NULL }
 };
 
