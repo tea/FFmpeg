@@ -54,6 +54,7 @@ typedef struct CuvidContext
     AVFifoBuffer *frame_queue;
 
     int deint_mode;
+    int deint_mode_current;
     int64_t prev_pts;
 
     int internal_error;
@@ -160,7 +161,11 @@ static int CUDAAPI cuvid_handle_video_sequence(void *opaque, CUVIDEOFORMAT* form
         (AVRational){ format->display_aspect_ratio.x, format->display_aspect_ratio.y },
         (AVRational){ avctx->width, avctx->height }));
 
-    if (!format->progressive_sequence && ctx->deint_mode == cudaVideoDeinterlaceMode_Weave)
+    ctx->deint_mode_current = format->progressive_sequence
+                              ? cudaVideoDeinterlaceMode_Weave
+                              : ctx->deint_mode;
+
+    if (!format->progressive_sequence && ctx->deint_mode_current == cudaVideoDeinterlaceMode_Weave)
         avctx->flags |= AV_CODEC_FLAG_INTERLACED_DCT;
     else
         avctx->flags &= ~AV_CODEC_FLAG_INTERLACED_DCT;
@@ -251,14 +256,9 @@ static int CUDAAPI cuvid_handle_video_sequence(void *opaque, CUVIDEOFORMAT* form
     cuinfo.ulNumOutputSurfaces = 1;
     cuinfo.ulCreationFlags = cudaVideoCreate_PreferCUVID;
     cuinfo.bitDepthMinus8 = format->bit_depth_luma_minus8;
+    cuinfo.DeinterlaceMode = ctx->deint_mode_current;
 
-    if (format->progressive_sequence) {
-        ctx->deint_mode = cuinfo.DeinterlaceMode = cudaVideoDeinterlaceMode_Weave;
-    } else {
-        cuinfo.DeinterlaceMode = ctx->deint_mode;
-    }
-
-    if (ctx->deint_mode != cudaVideoDeinterlaceMode_Weave)
+    if (ctx->deint_mode_current != cudaVideoDeinterlaceMode_Weave)
         avctx->framerate = av_mul_q(avctx->framerate, (AVRational){2, 1});
 
     ctx->internal_error = CHECK_CU(ctx->cvdl->cuvidCreateDecoder(&ctx->cudecoder, &cuinfo));
@@ -335,7 +335,7 @@ static int CUDAAPI cuvid_handle_picture_display(void *opaque, CUVIDPARSERDISPINF
     parsed_frame.dispinfo = *dispinfo;
     ctx->internal_error = 0;
 
-    if (ctx->deint_mode == cudaVideoDeinterlaceMode_Weave) {
+    if (ctx->deint_mode_current == cudaVideoDeinterlaceMode_Weave) {
         parsed_frame.a53_caption = a53_caption;
         parsed_frame.a53_caption_size = a53_caption_size;
         av_fifo_generic_write(ctx->frame_queue, &parsed_frame, sizeof(CuvidParsedFrame), NULL);
@@ -761,7 +761,7 @@ static int cuvid_decode_frame(AVCodecContext *avctx, void *data, int *got_frame,
 
     av_log(avctx, AV_LOG_TRACE, "cuvid_decode_frame\n");
 
-    if (ctx->deint_mode != cudaVideoDeinterlaceMode_Weave) {
+    if (ctx->deint_mode_current != cudaVideoDeinterlaceMode_Weave) {
         av_log(avctx, AV_LOG_ERROR, "Deinterlacing is not supported via the old API\n");
         return AVERROR(EINVAL);
     }
