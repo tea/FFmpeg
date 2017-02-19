@@ -19,6 +19,9 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include <stdint.h>
+#include <string.h>
+
 #include "compat/cuda/dynlink_loader.h"
 
 #include "libavutil/buffer.h"
@@ -30,6 +33,8 @@
 #include "libavutil/opt.h"
 #include "libavutil/pixdesc.h"
 
+#include "h264dec.h"
+#include "mpegvideo.h"
 #include "avcodec.h"
 #include "internal.h"
 
@@ -84,6 +89,27 @@ typedef struct CuvidParsedFrame
     uint8_t* a53_caption;
     int a53_caption_size;
 } CuvidParsedFrame;
+
+typedef struct CUVIDFrame {
+    int idx;
+    AVFrame *f;
+} CUVIDFrame;
+
+typedef struct CUVIDContext {
+    CudaFunctions *cudl;
+    CuvidFunctions *cvdl;
+    CUcontext      cuda_ctx;
+    CUvideodecoder decoder;
+    CUVIDPICPARAMS pic_params;
+
+    uint8_t     *bitstream;
+    int          bitstream_len;
+    unsigned int bitstream_allocated;
+
+    unsigned    *slice_offsets;
+    int          nb_slices;
+    unsigned int slice_offsets_allocated;
+} CUVIDContext;
 
 static int check_cu(AVCodecContext *avctx, CUresult err, const char *func)
 {
@@ -422,8 +448,9 @@ static void cuvid_h264_parse_a53(CuvidContext *ctx, const uint8_t* p, int buf_si
     const uint8_t* buf_end = p + buf_size;
     while(p < buf_end)
     {
-        int i;
+        int i, size, cc_count;
         uint32_t start_code = -1;
+	uint64_t new_size;
         p = avpriv_find_start_code(p, buf_end, &start_code);
             if (start_code > 0x1ff)
             break;
@@ -433,7 +460,7 @@ static void cuvid_h264_parse_a53(CuvidContext *ctx, const uint8_t* p, int buf_si
         if (buf_size < 1 || p[0] != 4)
             continue;
         p += 1; buf_size -= 1;
-        int size = 0;
+        size = 0;
         while (buf_size > 0)
         {
             size += p[0];
@@ -466,7 +493,7 @@ static void cuvid_h264_parse_a53(CuvidContext *ctx, const uint8_t* p, int buf_si
             continue;
         if (!(p[1] & 0x40))
             continue;
-        int cc_count = p[1] & 0x1F;
+        cc_count = p[1] & 0x1F;
         p+=3;
         size -= 3;
 
@@ -475,7 +502,7 @@ static void cuvid_h264_parse_a53(CuvidContext *ctx, const uint8_t* p, int buf_si
 
         if (!ctx->a53_caption)
             ctx->a53_caption_size = 0;
-        const uint64_t new_size = (ctx->a53_caption_size + cc_count * 3);
+        new_size = (ctx->a53_caption_size + cc_count * 3);
         if (av_reallocp(&ctx->a53_caption, new_size) < 0)
             continue;
         for(i = 0; i < cc_count; ++i, p += 3)
@@ -1175,7 +1202,7 @@ DEFINE_CUVID_CODEC(hevc, HEVC)
 #endif
 
 #if CONFIG_H264_CUVID_DECODER
-DEFINE_CUVID_CODEC(h264, H264)
+//DEFINE_CUVID_CODEC(h264, H264)
 #endif
 
 #if CONFIG_MJPEG_CUVID_DECODER
@@ -1187,7 +1214,7 @@ DEFINE_CUVID_CODEC(mpeg1, MPEG1VIDEO)
 #endif
 
 #if CONFIG_MPEG2_CUVID_DECODER
-DEFINE_CUVID_CODEC(mpeg2, MPEG2VIDEO)
+//DEFINE_CUVID_CODEC(mpeg2, MPEG2VIDEO)
 #endif
 
 #if CONFIG_MPEG4_CUVID_DECODER
@@ -1205,3 +1232,467 @@ DEFINE_CUVID_CODEC(vp9, VP9)
 #if CONFIG_VC1_CUVID_DECODER
 DEFINE_CUVID_CODEC(vc1, VC1)
 #endif
+
+
+static int map_avcodec_id(enum AVCodecID id)
+{
+    switch (id) {
+    case AV_CODEC_ID_H264: return cudaVideoCodec_H264;
+	case AV_CODEC_ID_MPEG2VIDEO: return cudaVideoCodec_MPEG2;
+    }
+    return -1;
+}
+
+static int map_chroma_format(enum AVPixelFormat pix_fmt)
+{
+    int shift_h = 0, shift_v = 0;
+
+    av_pix_fmt_get_chroma_sub_sample(pix_fmt, &shift_h, &shift_v);
+
+    if (shift_h == 1 && shift_v == 1)
+        return cudaVideoChromaFormat_420;
+    else if (shift_h == 1 && shift_v == 0)
+        return cudaVideoChromaFormat_422;
+    else if (shift_h == 0 && shift_v == 0)
+        return cudaVideoChromaFormat_444;
+
+    return -1;
+}
+
+static int ff_cuvid_decode_init(AVCodecContext *avctx)
+{
+    CUVIDContext *ctx = avctx->internal->hwaccel_priv_data;
+
+    AVHWFramesContext   *frames_ctx;
+    AVCUDADeviceContext *device_hwctx;
+
+    CUVIDDECODECREATEINFO params = { 0 };
+    CUcontext dummy;
+    CUresult err;
+
+    int cuvid_codec_type, cuvid_chroma_format;
+    int ret = 0;
+
+    cuvid_codec_type = map_avcodec_id(avctx->codec_id);
+    if (cuvid_codec_type < 0) {
+        av_log(avctx, AV_LOG_ERROR, "Unsupported codec ID\n");
+        return AVERROR_BUG;
+    }
+
+    cuvid_chroma_format = map_chroma_format(avctx->sw_pix_fmt);
+    if (cuvid_chroma_format < 0) {
+        av_log(avctx, AV_LOG_ERROR, "Unsupported chroma format\n");
+        return AVERROR(ENOSYS);
+    }
+
+    if (!avctx->hw_frames_ctx) {
+        av_log(avctx, AV_LOG_ERROR, "A hardware frames context is "
+               "required for CUVID decoding.\n");
+        return AVERROR(EINVAL);
+    }
+
+    frames_ctx   = (AVHWFramesContext*)avctx->hw_frames_ctx->data;
+    device_hwctx = frames_ctx->device_ctx->hwctx;
+
+    ctx->cudl = device_hwctx->internal->cuda_dl;
+    ctx->cuda_ctx = device_hwctx->cuda_ctx;
+
+    ret = cuvid_load_functions(&ctx->cvdl);
+    if (ret < 0) {
+        av_log(avctx, AV_LOG_ERROR, "Failed loading nvcuvid.\n");
+        goto finish;
+    }
+
+    params.ulWidth             = avctx->coded_width;
+    params.ulHeight            = avctx->coded_height;
+    params.ulTargetWidth       = avctx->coded_width;
+    params.ulTargetHeight      = avctx->coded_height;
+    params.OutputFormat        = cudaVideoSurfaceFormat_NV12;
+    params.CodecType           = cuvid_codec_type;
+    params.ChromaFormat        = cuvid_chroma_format;
+    params.ulNumDecodeSurfaces = 32;
+    params.ulNumOutputSurfaces = 1;
+	params.DeinterlaceMode = avctx->field_order <= AV_FIELD_PROGRESSIVE ? cudaVideoDeinterlaceMode_Weave : cudaVideoDeinterlaceMode_Bob;
+
+    err = ctx->cudl->cuCtxPushCurrent(ctx->cuda_ctx);
+    if (err != CUDA_SUCCESS)
+        return AVERROR_UNKNOWN;
+
+    err = ctx->cvdl->cuvidCreateDecoder(&ctx->decoder, &params);
+    if (err != CUDA_SUCCESS) {
+        ret = AVERROR_UNKNOWN;
+        goto finish;
+    }
+
+	avctx->field_order = AV_FIELD_PROGRESSIVE;
+	avctx->flags &= ~AV_CODEC_FLAG_INTERLACED_DCT;
+
+finish:
+    ctx->cudl->cuCtxPopCurrent(&dummy);
+
+    return ret;
+}
+
+static int ff_cuvid_decode_uninit(AVCodecContext *avctx)
+{
+    CUVIDContext *ctx = avctx->internal->hwaccel_priv_data;
+
+    av_freep(&ctx->bitstream);
+    ctx->bitstream_len       = 0;
+    ctx->bitstream_allocated = 0;
+
+    av_freep(&ctx->slice_offsets);
+    ctx->nb_slices               = 0;
+    ctx->slice_offsets_allocated = 0;
+
+    if (ctx->decoder)
+        ctx->cvdl->cuvidDestroyDecoder(ctx->decoder);
+    ctx->decoder = NULL;
+
+    cuvid_free_functions(&ctx->cvdl);
+
+
+    return 0;
+}
+
+static int ff_cuvid_start_frame(AVCodecContext *avctx)
+{
+    CUVIDContext *ctx = avctx->internal->hwaccel_priv_data;
+
+    ctx->bitstream_len = 0;
+    ctx->nb_slices     = 0;
+
+    return 0;
+}
+
+static int ff_cuvid_end_frame(AVCodecContext *avctx, CUVIDFrame *frame)
+{
+	MpegEncContext * const s = avctx->priv_data;
+	CUVIDContext  *ctx = avctx->internal->hwaccel_priv_data;
+    CUVIDPICPARAMS *pp = &ctx->pic_params;
+
+    CUVIDPROCPARAMS vpp = { 0 };
+    CUresult err;
+    CUcontext dummy;
+    CUdeviceptr devptr;
+
+	if (frame->f->interlaced_frame)
+	{
+		vpp.second_field = !s->first_field;
+		vpp.top_field_first = frame->f->top_field_first;
+	}
+	else
+	{
+		vpp.progressive_frame = 1;
+	}
+	frame->f->interlaced_frame = 0;
+
+    unsigned int pitch, i;
+    unsigned int offset = 0;
+    int ret = 0;
+
+    pp->nBitstreamDataLen = ctx->bitstream_len;
+    pp->pBitstreamData    = ctx->bitstream;
+    pp->nNumSlices        = ctx->nb_slices;
+    pp->pSliceDataOffsets = ctx->slice_offsets;
+
+    err = ctx->cudl->cuCtxPushCurrent(ctx->cuda_ctx);
+    if (err != CUDA_SUCCESS)
+        return AVERROR_UNKNOWN;
+
+    err = ctx->cvdl->cuvidDecodePicture(ctx->decoder, &ctx->pic_params);
+    if (err != CUDA_SUCCESS) {
+        av_log(avctx, AV_LOG_ERROR, "Error decoding a picture with CUVID: %d\n",
+               err);
+        ret = AVERROR_UNKNOWN;
+        goto finish;
+    }
+
+    if (pp->field_pic_flag && !pp->second_field)
+        goto finish;
+
+    err = ctx->cvdl->cuvidMapVideoFrame(ctx->decoder, frame->idx, &devptr, &pitch, &vpp);
+    if (err != CUDA_SUCCESS) {
+        av_log(avctx, AV_LOG_ERROR, "Error mapping a picture with CUVID: %d\n",
+               err);
+        ret = AVERROR_UNKNOWN;
+        goto finish;
+    }
+
+    for (i = 0; frame->f->data[i]; i++) {
+        CUDA_MEMCPY2D cpy = {
+            .srcMemoryType = CU_MEMORYTYPE_DEVICE,
+            .dstMemoryType = CU_MEMORYTYPE_DEVICE,
+            .srcDevice     = devptr,
+            .dstDevice     = (CUdeviceptr)frame->f->data[i],
+            .srcPitch      = pitch,
+            .dstPitch      = frame->f->linesize[i],
+            .srcY          = offset,
+            .WidthInBytes  = FFMIN(pitch, frame->f->linesize[i]),
+            .Height        = avctx->coded_height >> (i ? 1 : 0),
+        };
+
+        err = ctx->cudl->cuMemcpy2D(&cpy);
+        if (err != CUDA_SUCCESS) {
+            av_log(avctx, AV_LOG_ERROR, "Error copying decoded frame: %d\n",
+                   err);
+            ret = AVERROR_UNKNOWN;
+            goto copy_fail;
+        }
+
+        offset += cpy.Height;
+    }
+
+copy_fail:
+    ctx->cvdl->cuvidUnmapVideoFrame(ctx->decoder, devptr);
+
+finish:
+    ctx->cudl->cuCtxPopCurrent(&dummy);
+    return ret;
+}
+
+
+
+
+
+
+
+static void dpb_add(const H264Context *h, CUVIDH264DPBENTRY *dst, const H264Picture *src,
+                    int frame_idx)
+{
+    const CUVIDFrame *frame = src->hwaccel_picture_private;
+
+    dst->PicIdx             = frame->idx;
+    dst->FrameIdx           = frame_idx;
+    dst->is_long_term       = src->long_ref;
+    dst->not_existing       = 0;
+    dst->used_for_reference = src->reference & 3;
+    dst->FieldOrderCnt[0]   = src->field_poc[0];
+    dst->FieldOrderCnt[1]   = src->field_poc[1];
+}
+
+static int cuvid_h264_start_frame(AVCodecContext *avctx,
+                                  const uint8_t *buffer, uint32_t size)
+{
+    const H264Context *h = avctx->priv_data;
+    const PPS *pps = h->ps.pps;
+    const SPS *sps = h->ps.sps;
+
+    CUVIDContext       *ctx = avctx->internal->hwaccel_priv_data;
+    CUVIDPICPARAMS      *pp = &ctx->pic_params;
+    CUVIDH264PICPARAMS *ppc = &pp->CodecSpecific.h264;
+    CUVIDFrame       *frame = h->cur_pic_ptr->hwaccel_picture_private;
+
+    int i, dpb_size;
+
+    frame->idx = h->cur_pic_ptr - h->DPB;
+    frame->f   = h->cur_pic_ptr->f;
+
+    *pp = (CUVIDPICPARAMS) {
+        .PicWidthInMbs     = h->mb_width,
+        .FrameHeightInMbs  = h->mb_height,
+        .CurrPicIdx        = frame->idx,
+        .field_pic_flag    = FIELD_PICTURE(h),
+        .bottom_field_flag = h->picture_structure == PICT_BOTTOM_FIELD,
+        .second_field      = FIELD_PICTURE(h) && !h->first_field,
+        .ref_pic_flag      = h->nal_ref_idc != 0,
+        .intra_pic_flag    = 0,
+
+        .CodecSpecific.h264 = {
+            .log2_max_frame_num_minus4            = sps->log2_max_frame_num - 4,
+            .pic_order_cnt_type                   = sps->poc_type,
+            .log2_max_pic_order_cnt_lsb_minus4    = FFMAX(sps->log2_max_poc_lsb - 4, 0),
+            .delta_pic_order_always_zero_flag     = sps->delta_pic_order_always_zero_flag,
+            .frame_mbs_only_flag                  = sps->frame_mbs_only_flag,
+            .direct_8x8_inference_flag            = sps->direct_8x8_inference_flag,
+            .num_ref_frames                       = sps->ref_frame_count,
+            .residual_colour_transform_flag       = sps->residual_color_transform_flag,
+            .bit_depth_luma_minus8                = sps->bit_depth_luma - 8,
+            .bit_depth_chroma_minus8              = sps->bit_depth_chroma - 8,
+            .qpprime_y_zero_transform_bypass_flag = sps->transform_bypass,
+
+            .entropy_coding_mode_flag               = pps->cabac,
+            .pic_order_present_flag                 = pps->pic_order_present,
+            .num_ref_idx_l0_active_minus1           = pps->ref_count[0] - 1,
+            .num_ref_idx_l1_active_minus1           = pps->ref_count[1] - 1,
+            .weighted_pred_flag                     = pps->weighted_pred,
+            .weighted_bipred_idc                    = pps->weighted_bipred_idc,
+            .pic_init_qp_minus26                    = pps->init_qp - 26,
+            .deblocking_filter_control_present_flag = pps->deblocking_filter_parameters_present,
+            .redundant_pic_cnt_present_flag         = pps->redundant_pic_cnt_present,
+            .transform_8x8_mode_flag                = pps->transform_8x8_mode,
+            .MbaffFrameFlag                         = sps->mb_aff && !FIELD_PICTURE(h),
+            .constrained_intra_pred_flag            = pps->constrained_intra_pred,
+            .chroma_qp_index_offset                 = pps->chroma_qp_index_offset[0],
+            .second_chroma_qp_index_offset          = pps->chroma_qp_index_offset[1],
+            .ref_pic_flag                           = h->nal_ref_idc != 0,
+            .frame_num                              = h->poc.frame_num,
+            .CurrFieldOrderCnt[0]                   = h->cur_pic_ptr->field_poc[0],
+            .CurrFieldOrderCnt[1]                   = h->cur_pic_ptr->field_poc[1],
+        },
+    };
+
+    memcpy(ppc->WeightScale4x4,    pps->scaling_matrix4,    sizeof(ppc->WeightScale4x4));
+    memcpy(ppc->WeightScale8x8[0], pps->scaling_matrix8[0], sizeof(ppc->WeightScale8x8[0]));
+    memcpy(ppc->WeightScale8x8[1], pps->scaling_matrix8[3], sizeof(ppc->WeightScale8x8[0]));
+
+    dpb_size = 0;
+    for (i = 0; i < h->short_ref_count; i++)
+        dpb_add(h, &ppc->dpb[dpb_size++], h->short_ref[i], h->short_ref[i]->frame_num);
+    for (i = 0; i < 16; i++) {
+        if (h->long_ref[i])
+            dpb_add(h, &ppc->dpb[dpb_size++], h->long_ref[i], i);
+    }
+
+    for (i = dpb_size; i < FF_ARRAY_ELEMS(ppc->dpb); i++)
+        ppc->dpb[i].PicIdx       = -1;
+
+    return ff_cuvid_start_frame(avctx);
+}
+
+static int cuvid_h264_decode_slice(AVCodecContext *avctx, const uint8_t *buffer,
+                                   uint32_t size)
+{
+    CUVIDContext *ctx = avctx->internal->hwaccel_priv_data;
+    void *tmp;
+
+    tmp = av_fast_realloc(ctx->bitstream, &ctx->bitstream_allocated,
+                          ctx->bitstream_len + size + 3);
+    if (!tmp)
+        return AVERROR(ENOMEM);
+    ctx->bitstream = tmp;
+
+    tmp = av_fast_realloc(ctx->slice_offsets, &ctx->slice_offsets_allocated,
+                          (ctx->nb_slices + 1) * sizeof(*ctx->slice_offsets));
+    if (!tmp)
+        return AVERROR(ENOMEM);
+    ctx->slice_offsets = tmp;
+
+    AV_WB24(ctx->bitstream + ctx->bitstream_len, 1);
+    memcpy(ctx->bitstream + ctx->bitstream_len + 3, buffer, size);
+    ctx->slice_offsets[ctx->nb_slices] = ctx->bitstream_len ;
+    ctx->bitstream_len += size + 3;
+    ctx->nb_slices++;
+
+    return 0;
+}
+
+static int cuvid_h264_end_frame(AVCodecContext *avctx)
+{
+    H264Context *h = avctx->priv_data;
+    return ff_cuvid_end_frame(avctx, h->cur_pic_ptr->hwaccel_picture_private);
+}
+
+AVHWAccel ff_h264_cuvid_hwaccel = {
+    .name                 = "h264_cuvid",
+    .type                 = AVMEDIA_TYPE_VIDEO,
+    .id                   = AV_CODEC_ID_H264,
+    .pix_fmt              = AV_PIX_FMT_CUDA,
+    .start_frame          = cuvid_h264_start_frame,
+    .end_frame            = cuvid_h264_end_frame,
+    .decode_slice         = cuvid_h264_decode_slice,
+    .init                 = ff_cuvid_decode_init,
+    .uninit               = ff_cuvid_decode_uninit,
+    .priv_data_size       = sizeof(CUVIDContext),
+    .frame_priv_data_size = sizeof(CUVIDFrame),
+};
+
+static int cuvid_mpeg2_start_frame(AVCodecContext *avctx, const uint8_t *buffer, uint32_t size)
+{
+    MpegEncContext * const s = avctx->priv_data;
+    Picture *pic             = s->current_picture_ptr;
+
+    CUVIDContext       *ctx = avctx->internal->hwaccel_priv_data;
+    CUVIDPICPARAMS      *pp = &ctx->pic_params;
+    CUVIDMPEG2PICPARAMS *ppc = &pp->CodecSpecific.mpeg2;
+    CUVIDFrame       *frame = s->current_picture_ptr->hwaccel_picture_private;
+
+    int i;
+
+    frame->idx = pic - s->picture;
+    frame->f   = pic->f;
+
+    *pp = (CUVIDPICPARAMS) {
+        .PicWidthInMbs     = s->mb_width,
+        .FrameHeightInMbs  = s->mb_height,
+        .CurrPicIdx        = frame->idx,
+        .field_pic_flag    = s->picture_structure != PICT_FRAME,
+        .bottom_field_flag = s->picture_structure == PICT_BOTTOM_FIELD,
+        .second_field      = s->picture_structure != PICT_FRAME && !s->first_field,
+        .ref_pic_flag      = pic->reference != 0,
+        .intra_pic_flag    = 0,
+
+        .CodecSpecific.mpeg2 = {
+	    .ForwardRefIdx = s->pict_type == AV_PICTURE_TYPE_B || s->pict_type == AV_PICTURE_TYPE_P ? s->last_picture_ptr - s->picture : -1,
+	    .BackwardRefIdx = s->pict_type == AV_PICTURE_TYPE_B ? s->next_picture_ptr - s->picture : -1,
+	    .picture_coding_type = s->pict_type,
+	    .full_pel_forward_vector = s->full_pel[0],
+	    .full_pel_backward_vector = s->full_pel[1],
+	    .intra_dc_precision = s->intra_dc_precision,
+	    .frame_pred_frame_dct = s->frame_pred_frame_dct,
+	    .concealment_motion_vectors = s->concealment_motion_vectors,
+	    .q_scale_type = s->q_scale_type,
+	    .intra_vlc_format = s->intra_vlc_format,
+	    .alternate_scan = s->alternate_scan,
+	    .top_field_first = s->top_field_first,
+	}
+    };
+
+    ppc->f_code[0][0]               = s->mpeg_f_code[0][0];
+    ppc->f_code[0][1]               = s->mpeg_f_code[0][1];
+    ppc->f_code[1][0]               = s->mpeg_f_code[1][0];
+    ppc->f_code[1][1]               = s->mpeg_f_code[1][1];
+
+    for (i = 0; i < 64; ++i) {
+        ppc->QuantMatrixIntra[i] = s->intra_matrix[i];
+        ppc->QuantMatrixInter[i] = s->inter_matrix[i];
+    }
+
+    return ff_cuvid_start_frame(avctx);
+}
+
+static int cuvid_mpeg2_decode_slice(AVCodecContext *avctx, const uint8_t *buffer,
+                                   uint32_t size)
+{
+    CUVIDContext *ctx = avctx->internal->hwaccel_priv_data;
+    void *tmp;
+
+    tmp = av_fast_realloc(ctx->bitstream, &ctx->bitstream_allocated,
+                          ctx->bitstream_len + size);
+    if (!tmp)
+        return AVERROR(ENOMEM);
+    ctx->bitstream = tmp;
+
+    tmp = av_fast_realloc(ctx->slice_offsets, &ctx->slice_offsets_allocated,
+                          (ctx->nb_slices + 1) * sizeof(*ctx->slice_offsets));
+    if (!tmp)
+        return AVERROR(ENOMEM);
+    ctx->slice_offsets = tmp;
+
+    memcpy(ctx->bitstream + ctx->bitstream_len, buffer, size);
+    ctx->slice_offsets[ctx->nb_slices] = ctx->bitstream_len ;
+    ctx->bitstream_len += size;
+    ctx->nb_slices++;
+
+    return 0;
+}
+
+static int cuvid_mpeg2_end_frame(AVCodecContext *avctx)
+{
+	MpegEncContext * const s = avctx->priv_data;
+	return ff_cuvid_end_frame(avctx, s->current_picture_ptr->hwaccel_picture_private);
+}
+
+AVHWAccel ff_mpeg2_cuvid_hwaccel = {
+    .name                 = "mpeg2_cuvid",
+    .type                 = AVMEDIA_TYPE_VIDEO,
+    .id                   = AV_CODEC_ID_MPEG2VIDEO,
+    .pix_fmt              = AV_PIX_FMT_CUDA,
+    .start_frame          = cuvid_mpeg2_start_frame,
+    .end_frame            = cuvid_mpeg2_end_frame,
+    .decode_slice         = cuvid_mpeg2_decode_slice,
+    .init                 = ff_cuvid_decode_init,
+    .uninit               = ff_cuvid_decode_uninit,
+    .priv_data_size       = sizeof(CUVIDContext),
+    .frame_priv_data_size = sizeof(CUVIDFrame),
+};

@@ -24,15 +24,16 @@ typedef struct CUVIDContext {
     AVBufferRef *hw_frames_ctx;
 } CUVIDContext;
 
+static int cuvid_get_buffer(AVCodecContext *s, AVFrame *frame, int flags)
+{
+	InputStream *ist = s->opaque;
+
+	return av_hwframe_get_buffer(ist->hw_frames_ctx, frame, 0);
+}
+
 static void cuvid_uninit(AVCodecContext *avctx)
 {
     InputStream  *ist = avctx->opaque;
-    CUVIDContext *ctx = ist->hwaccel_ctx;
-
-    if (ctx) {
-        av_buffer_unref(&ctx->hw_frames_ctx);
-        av_freep(&ctx);
-    }
 
     av_buffer_unref(&ist->hw_frames_ctx);
 
@@ -43,113 +44,87 @@ static void cuvid_uninit(AVCodecContext *avctx)
 int cuvid_init(AVCodecContext *avctx)
 {
     InputStream  *ist = avctx->opaque;
-    CUVIDContext *ctx = ist->hwaccel_ctx;
 
     av_log(NULL, AV_LOG_TRACE, "Initializing cuvid hwaccel\n");
 
-    if (!ctx) {
-        av_log(NULL, AV_LOG_ERROR, "CUVID transcoding is not initialized. "
-               "-hwaccel cuvid should only be used for one-to-one CUVID transcoding "
-               "with no (software) filters.\n");
-        return AVERROR(EINVAL);
-    }
-
+	if (!ist->hw_frames_ctx)
+	{
+		av_log(NULL, AV_LOG_ERROR, "hw_frames_ctx is not set on CUVID input");
+		return -1;
+	}
     return 0;
 }
 
 int cuvid_transcode_init(OutputStream *ost)
 {
-    InputStream *ist;
-    const enum AVPixelFormat *pix_fmt;
-    AVHWFramesContext *hwframe_ctx;
-    AVBufferRef *device_ref = NULL;
-    CUVIDContext *ctx = NULL;
-    int ret = 0;
+	InputStream *ist = NULL;
+	const enum AVPixelFormat *pix_fmt;
+	AVHWFramesContext *encode_frames;
+	AVBufferRef *encode_frames_ref = NULL;
+	int err = 0;
 
-    av_log(NULL, AV_LOG_TRACE, "Initializing cuvid transcoding\n");
+	if (!ost->enc->pix_fmts)
+		goto error;
+	for (pix_fmt = ost->enc->pix_fmts; *pix_fmt != AV_PIX_FMT_NONE; pix_fmt++)
+		if (*pix_fmt == AV_PIX_FMT_CUDA)
+			break;
+	if (*pix_fmt == AV_PIX_FMT_NONE)
+		goto error;
 
-    if (ost->source_index < 0)
-        return 0;
+	if (ost->source_index < 0)
+		goto error;
 
-    ist = input_streams[ost->source_index];
+	ist = input_streams[ost->source_index];
+	if (ist->dec && ist->dec->pix_fmts)
+	{
+		for (pix_fmt = ist->dec->pix_fmts; *pix_fmt != AV_PIX_FMT_NONE; pix_fmt++)
+			if (*pix_fmt == AV_PIX_FMT_CUDA)
+				break;
+		if (*pix_fmt == AV_PIX_FMT_NONE)
+			goto error;
+	}
 
-    /* check if the encoder supports CUVID */
-    if (!ost->enc->pix_fmts)
-        goto cancel;
-    for (pix_fmt = ost->enc->pix_fmts; *pix_fmt != AV_PIX_FMT_NONE; pix_fmt++)
-        if (*pix_fmt == AV_PIX_FMT_CUDA)
-            break;
-    if (*pix_fmt == AV_PIX_FMT_NONE)
-        goto cancel;
+	if (!hw_device_ctx) {
+		err = av_hwdevice_ctx_create(&hw_device_ctx, AV_HWDEVICE_TYPE_CUDA, ist->hwaccel_device, NULL, 0);
+		if (err < 0)
+			goto error;
+	}
 
-    /* check if the decoder supports CUVID */
-    if (ist->hwaccel_id != HWACCEL_CUVID || !ist->dec || !ist->dec->pix_fmts)
-        goto cancel;
-    for (pix_fmt = ist->dec->pix_fmts; *pix_fmt != AV_PIX_FMT_NONE; pix_fmt++)
-        if (*pix_fmt == AV_PIX_FMT_CUDA)
-            break;
-    if (*pix_fmt == AV_PIX_FMT_NONE)
-        goto cancel;
+	encode_frames_ref = av_hwframe_ctx_alloc(hw_device_ctx);
+	if (!encode_frames_ref) {
+		err = AVERROR(ENOMEM);
+		goto error;
+	}
+	encode_frames = (AVHWFramesContext*)encode_frames_ref->data;
 
-    av_log(NULL, AV_LOG_VERBOSE, "Setting up CUVID transcoding\n");
+	encode_frames->width = FFALIGN(ist->resample_width, 32);
+	encode_frames->height = FFALIGN(ist->resample_height, 32);
+	encode_frames->format = AV_PIX_FMT_CUDA;
+	encode_frames->sw_format = AV_PIX_FMT_NV12;
+	encode_frames->initial_pool_size = 1;
 
-    if (ist->hwaccel_ctx) {
-        ctx = ist->hwaccel_ctx;
-    } else {
-        ctx = av_mallocz(sizeof(*ctx));
-        if (!ctx) {
-            ret = AVERROR(ENOMEM);
-            goto error;
-        }
-    }
+	err = av_hwframe_ctx_init(encode_frames_ref);
+	if (err < 0)
+		goto error;
 
-    if (!ctx->hw_frames_ctx) {
-        ret = av_hwdevice_ctx_create(&device_ref, AV_HWDEVICE_TYPE_CUDA,
-                                     ist->hwaccel_device, NULL, 0);
-        if (ret < 0)
-            goto error;
+	ist->dec_ctx->pix_fmt = AV_PIX_FMT_CUDA;
+	ist->resample_pix_fmt = AV_PIX_FMT_CUDA;
 
-        ctx->hw_frames_ctx = av_hwframe_ctx_alloc(device_ref);
-        if (!ctx->hw_frames_ctx) {
-            av_log(NULL, AV_LOG_ERROR, "av_hwframe_ctx_alloc failed\n");
-            ret = AVERROR(ENOMEM);
-            goto error;
-        }
-        av_buffer_unref(&device_ref);
+	ost->enc_ctx->pix_fmt = AV_PIX_FMT_CUDA;
+	ost->enc_ctx->hw_frames_ctx = encode_frames_ref;
 
-        ist->hw_frames_ctx = av_buffer_ref(ctx->hw_frames_ctx);
-        if (!ist->hw_frames_ctx) {
-            av_log(NULL, AV_LOG_ERROR, "av_buffer_ref failed\n");
-            ret = AVERROR(ENOMEM);
-            goto error;
-        }
+	ist->hwaccel_get_buffer = cuvid_get_buffer;
+	ist->hwaccel_uninit = cuvid_uninit;
+	ist->hw_frames_ctx = av_buffer_ref(encode_frames_ref);
 
-        ist->hwaccel_ctx = ctx;
-        ist->resample_pix_fmt = AV_PIX_FMT_CUDA;
-        ist->hwaccel_uninit = cuvid_uninit;
-
-        /* This is a bit hacky, av_hwframe_ctx_init is called by the cuvid decoder
-         * once it has probed the necessary format information. But as filters/nvenc
-         * need to know the format/sw_format, set them here so they are happy.
-         * This is fine as long as CUVID doesn't add another supported pix_fmt.
-         */
-        hwframe_ctx = (AVHWFramesContext*)ctx->hw_frames_ctx->data;
-        hwframe_ctx->format = AV_PIX_FMT_CUDA;
-        hwframe_ctx->sw_format = ist->st->codecpar->format == AV_PIX_FMT_YUV420P10 ? AV_PIX_FMT_P010 : AV_PIX_FMT_NV12;
-    }
-
-    return 0;
+	return 0;
 
 error:
-    av_freep(&ctx);
-    av_buffer_unref(&device_ref);
-    return ret;
+	if (ist && ist->hwaccel_id == HWACCEL_CUVID) {
+		av_log(NULL, AV_LOG_ERROR, "CUVID decoding requested but GPU transcoding init failed\n");
+		if (!err)
+			err = -1;
+	}
 
-cancel:
-    if (ist->hwaccel_id == HWACCEL_CUVID) {
-        av_log(NULL, AV_LOG_ERROR, "CUVID hwaccel requested, but impossible to achieve.\n");
-        return AVERROR(EINVAL);
-    }
-
-    return 0;
+    return err;
 }

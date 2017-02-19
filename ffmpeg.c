@@ -2718,7 +2718,7 @@ static int init_input_stream(int ist_index, char *error, int error_len)
     int i, ret;
     InputStream *ist = input_streams[ist_index];
 
-    for (i = 0; i < ist->nb_filters; i++) {
+	for (i = 0; i < ist->nb_filters; i++) {
         ret = ifilter_parameters_from_decoder(ist->filters[i], ist->dec_ctx);
         if (ret < 0) {
             av_log(NULL, AV_LOG_FATAL, "Error initializing filter input\n");
@@ -3465,12 +3465,12 @@ static int transcode_init(void)
             if (qsv_transcode_init(ost))
                 exit_program(1);
 #endif
-
 #if CONFIG_CUVID
-            if (cuvid_transcode_init(ost))
-                exit_program(1);
+			if (cuvid_transcode_init(ost))
+				exit_program(1);
 #endif
-        }
+
+		}
     }
 
     /* init input streams */
