@@ -95,6 +95,8 @@ AVBufferRef *hw_device_ctx;
 char *vstats_filename;
 char *sdp_filename;
 
+char *description_name;
+
 float audio_drift_threshold = 0.1;
 float dts_delta_threshold   = 10;
 float dts_error_threshold   = 3600*30;
@@ -3328,7 +3330,9 @@ static int opt_progress(void *optctx, const char *opt, const char *arg)
 const OptionDef options[] = {
     /* main options */
 #include "cmdutils_common_opts.h"
-    { "f",              HAS_ARG | OPT_STRING | OPT_OFFSET |
+	{ "name",           HAS_ARG | OPT_STRING,{ &description_name },
+		"Ignored field" },
+	{ "f",              HAS_ARG | OPT_STRING | OPT_OFFSET |
                         OPT_INPUT | OPT_OUTPUT,                      { .off       = OFFSET(format) },
         "force format", "fmt" },
     { "y",              OPT_BOOL,                                    {              &file_overwrite },
