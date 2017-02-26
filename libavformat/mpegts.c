@@ -143,6 +143,7 @@ struct MpegTSContext {
 
     int skip_changes;
     int skip_clear;
+    int skip_tei;
 
     int scan_all_pmts;
 
@@ -176,6 +177,8 @@ static const AVOption options[] = {
      {.i64 = 0}, 0, 1, 0 },
     {"skip_clear", "skip clearing programs", offsetof(MpegTSContext, skip_clear), AV_OPT_TYPE_BOOL,
      {.i64 = 0}, 0, 1, 0 },
+    {"skip_tei", "Ignore TS packets marked with TEI", offsetof(MpegTSContext, skip_tei), AV_OPT_TYPE_BOOL,
+     {.i64 = 0}, 0, 1, AV_OPT_FLAG_DECODING_PARAM },
     { NULL },
 };
 
@@ -2256,6 +2259,14 @@ static int handle_packet(MpegTSContext *ts, const uint8_t *packet)
     int64_t pos;
 
     pid = AV_RB16(packet + 1) & 0x1fff;
+
+    if (ts->skip_tei && (packet[1] & 0x80))
+    {
+        av_log(ts->stream, AV_LOG_DEBUG, "Skipping TEI-marked packet (presumed pid %d)\n", pid);
+        return 0;
+    }
+
+
     if (pid && discard_pid(ts, pid))
         return 0;
     is_start = packet[1] & 0x40;
